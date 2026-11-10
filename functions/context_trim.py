@@ -269,8 +269,8 @@ class Filter:
             )
             if wanted and wanted in models:
                 return wanted
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("context_trim: could not look up the task model: %s", e)
         return self.valves.summary_model or chat_model
 
     def _chunks(self, msgs: list) -> list:
