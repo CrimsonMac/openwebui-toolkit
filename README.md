@@ -30,6 +30,8 @@ Replace the path with any file from the tables below. Pasting the file's content
 | [context_trim.py](functions/context_trim.py) | Filter | Lets a chat continue past the context limit: old turns are folded into a rolling summary, the cut point stays put between trims so the prompt cache survives |
 | [date_context.py](functions/date_context.py) | Filter | Tells the model today's date (and optionally the time) without invalidating the prompt cache every turn |
 | [output_cleanup.py](functions/output_cleanup.py) | Filter | Removes leaked chat-template tokens, cuts a reply that got stuck repeating itself, collapses blank lines; leaves code blocks alone |
+| [cache_watch.py](functions/cache_watch.py) | Filter | Warns when an early change forces the backend to re-read the conversation, says what changed and roughly how long it takes |
+| [quick_answer.py](functions/quick_answer.py) | Filter (switch) | A switch in the message box that turns off the thinking phase for quick questions |
 | [handoff_brief.py](functions/handoff_brief.py) | Action | Button under a reply that writes a brief of the whole chat to paste into a fresh one |
 | [second_opinion.py](functions/second_opinion.py) | Pipe | A model entry where one model drafts, a second reviews, and the first revises |
 
@@ -60,7 +62,7 @@ Skills marked with a script ship a helper the model can run when code execution 
 | [json-wrangling](skills/json-wrangling/SKILL.md) | Inspect, query, diff and repair JSON | `json_tool.py` |
 | [linux-troubleshooting](skills/linux-troubleshooting/SKILL.md) | Diagnose slowness, full disks, failing services | `sysinfo.sh` |
 | [log-triage](skills/log-triage/SKILL.md) | Find what went wrong in a log | `log_summary.py` |
-| [ollama-tuning](skills/ollama-tuning/SKILL.md) | Context size, memory, speed and Modelfiles | `vram_estimate.py` |
+| [ollama-tuning](skills/ollama-tuning/SKILL.md) | Context size, memory, speed and Modelfiles | `vram_estimate.py`, `ollama_bench.py`, `ollama_prewarm.py` |
 | [openwebui-extension-author](skills/openwebui-extension-author/SKILL.md) | Write Open WebUI tools and functions | |
 | [prompt-crafting](skills/prompt-crafting/SKILL.md) | Write prompts and system prompts, including for small models | |
 | [python-quality](skills/python-quality/SKILL.md) | Write good Python and check existing code | `py_check.py` |
@@ -82,7 +84,7 @@ The scripts are plain Python or Bash with no dependencies and work on their own 
 
 When a chat grows past the budget, the oldest turns are removed and replaced by a summary note in the system prompt.
 
-- **Rolling summary.** Removed turns are summarized by the task model, and each later trim folds the next batch into the same note. If the summary call fails, the turns are dropped and the note says so.
+- **Rolling summary.** Removed turns are summarized by the chat's own model with thinking off (set `summary_model` to `task` or a model id to change that), and each later trim folds the next batch into the same note. If the summary call fails, the turns are dropped and the note says so.
 - **Stable cut point.** A trim cuts down to 70 % of the budget and then leaves the history alone until the budget is hit again. The prompt prefix stays identical in between, so Ollama can reuse its prompt cache instead of re-reading the whole chat every turn.
 - **Whole turns only.** The kept history always starts on a user message, so tool calls are never separated from their results.
 - **Automatic budget.** Taken from `num_ctx` on the request or the model, × 0.9, minus room for the reply. If no `num_ctx` is found it uses `fallback_token_budget`. Set `token_budget` to pin it by hand.
@@ -94,8 +96,9 @@ When a chat grows past the budget, the oldest turns are removed and replaced by 
 |---|---|---|
 | `token_budget` | `0` (auto) | Pin this if `num_ctx` is not set where the filter can see it |
 | `trim_to_ratio` | `0.7` | Lower trims less often but keeps less verbatim history |
-| `summary_model` | task model | Any model id; a larger model writes better summaries but is slower |
-| `summary_num_ctx` | `16384` | Sent with summary calls to Ollama so a small task model does not truncate its input |
+| `summary_model` | chat model | `task` for Open WebUI's task model, or any model id |
+| `max_reread_seconds` + `read_tokens_per_second` | off | Cap the history by how long a full re-read may take, using your measured prompt speed |
+| `summary_num_ctx` | `16384` | Sent with summary calls when a different Ollama model writes them |
 | `keep_images_in_last` | `4` | |
 
 ## Tests

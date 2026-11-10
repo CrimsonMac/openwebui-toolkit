@@ -112,8 +112,8 @@ def test_trims_summarizes_and_keeps_turns_whole():
     assert out[0]["content"].startswith("You are helpful.")
     assert out[1]["role"] == "user", "history must start on a user turn"
     assert out[-1]["content"] == "latest question"
-    assert calls and all(c["model"] == "tiny" for c in calls), "task model should summarize"
-    assert calls[0]["options"]["num_ctx"] == 16384
+    assert calls and all(c["model"] == "big" for c in calls), "the chat model summarizes by default"
+    assert calls[0]["options"] == {"think": False}, "no context size is sent to the chat model"
     assert any(e["data"]["done"] for e in events)
 
 
@@ -218,6 +218,33 @@ def test_budget_auto_detects_num_ctx():
     assert f._budget({"options": {"num_ctx": 32768}}, None) == int(32768 * 0.9) - 4096
     assert f._budget({}, {"info": {"params": {"num_ctx": 8192}}}) == int(8192 * 0.9) - 4096
     assert f._budget({}, None) == 200000
+
+
+def test_budget_capped_by_reread_time():
+    f = new_filter(max_reread_seconds=120, read_tokens_per_second=400)
+    assert f._budget({"options": {"num_ctx": 262144}}, None) == 48000
+    assert f._budget({"options": {"num_ctx": 16384}}, None) == int(16384 * 0.9) - 4096, "the smaller limit wins"
+    f = new_filter(token_budget=100000, max_reread_seconds=60, read_tokens_per_second=200)
+    assert f._budget({}, None) == 12000
+    assert new_filter(max_reread_seconds=120)._budget({}, None) == 200000, "needs a speed to apply"
+
+
+def test_summary_model_choices():
+    calls.clear()
+    f = new_filter(token_budget=20000, summary_model="task")
+    run(f, convo(15), "taskmodel")
+    assert calls and all(c["model"] == "tiny" for c in calls)
+    assert calls[0]["options"] == {"num_ctx": 16384, "think": False}
+
+    calls.clear()
+    f = new_filter(token_budget=20000, summary_model="missing-model")
+    run(f, convo(15), "missingmodel")
+    assert calls and all(c["model"] == "big" for c in calls), "unknown model falls back to the chat model"
+
+    calls.clear()
+    f = new_filter(token_budget=20000)
+    run(f, convo(15), "samemodel2", options={"num_ctx": 32768, "num_batch": 2048, "temperature": 0.3})
+    assert calls and all(c["options"] == {"num_ctx": 32768, "num_batch": 2048, "think": False} for c in calls), "reuse the chat's load settings"
 
 
 def test_tool_messages_never_orphaned():

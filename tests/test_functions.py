@@ -95,6 +95,66 @@ def test_output_cleanup():
     assert run(F.outlet(listy)) == listy
 
 
+def test_cache_watch():
+    F = load("cache_watch").Filter()
+    F.valves.read_tokens_per_second = 200
+    events = []
+
+    async def emit(e):
+        events.append(e["data"]["description"])
+
+    def turn(msgs, chat="c"):
+        events.clear()
+        run(F.inlet({"model": "m", "messages": msgs}, __metadata__={"chat_id": chat}, __event_emitter__=emit))
+        return list(events)
+
+    big = "x" * 33000  # about 10k tokens
+    sys_, u1, a1, u2, a2, u3 = (
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "q1 " + big},
+        {"role": "assistant", "content": "a1 " + big},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "q3"},
+    )
+    assert turn([sys_, u1]) == [], "first sighting: nothing to compare"
+    assert turn([sys_, u1, a1, u2]) == [], "growing at the end keeps the cache"
+    assert turn([sys_, u1, a1, u2]) == [], "regenerate keeps the cache"
+    assert turn([sys_, u1, a1, u2, a2, u3]) == []
+
+    out = turn([{"role": "system", "content": "Be brief. Today is Tuesday."}, u1, a1, u2, a2, u3])
+    assert len(out) == 1 and "system prompt changed" in out[0] and "20k tokens" in out[0] and "roughly 2 min" in out[0], out
+
+    turn([sys_, u1, a1, u2, a2, u3])
+    out = turn([sys_, a1, u2, a2, u3])
+    assert "1 earlier message(s) were removed" in out[0], out
+
+    turn([sys_, u1, a1, u2, a2, u3], chat="edit")
+    out = turn([sys_, {"role": "user", "content": "q1 edited " + big}, a1, u2, a2, u3], chat="edit")
+    assert "message 2 (user) is different" in out[0], out
+
+    turn([sys_, u1, a1, u2], chat="tail")
+    assert turn([sys_, u1, a1, {"role": "user", "content": "q2 [Sent at 12:00]"}, a2, u3], chat="tail") == [], "a small change near the end is not worth a warning"
+
+    F.valves.report_hits = True
+    turn([sys_, u1], chat="hit")
+    assert "Prompt cache reused" in turn([sys_, u1, a1, u2], chat="hit")[0]
+    assert turn([sys_, u1], chat="") == [] and turn([sys_, u1, a1, u2], chat="") == [], "no chat id, no tracking"
+
+
+def test_quick_answer():
+    F = load("quick_answer").Filter()
+    assert F.toggle is True and F.icon.startswith("data:image/svg+xml;base64,")
+    ollama = {"owned_by": "ollama"}
+    body = run(F.inlet({"messages": [], "options": {"num_ctx": 8192}}, __model__=ollama))
+    assert body["options"] == {"num_ctx": 8192, "think": False}
+    assert run(F.inlet({"messages": []}, __model__=ollama))["options"] == {"think": False}
+    assert "options" not in run(F.inlet({"messages": []}, __model__={"owned_by": "openai"})), "other backends are left alone"
+    assert "options" not in run(F.inlet({"messages": []}, __model__=ollama, __metadata__={"task": "title_generation"}))
+    F.valves.temperature, F.valves.top_p = 0.7, 0.8
+    assert run(F.inlet({"messages": []}, __model__=ollama))["options"] == {"think": False, "temperature": 0.7, "top_p": 0.8}
+
+
 def test_handoff_brief():
     A = load("handoff_brief").Action()
     calls.clear()

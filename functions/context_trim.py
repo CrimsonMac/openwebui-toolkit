@@ -1,7 +1,7 @@
 """
 title: Context Trim
 author: Crimson
-version: 2.0.0
+version: 2.1.0
 required_open_webui_version: 0.5.0
 description: Lets a chat continue past the context limit. Old turns are folded into a rolling summary, the cut point stays put between trims (so the prompt cache survives), old images are dropped, and token estimates calibrate themselves against real usage.
 """
@@ -24,6 +24,8 @@ log = logging.getLogger("context_trim")
 IMAGE_PLACEHOLDER = "[image removed from history]"
 MAX_SUMMARY_CHUNKS = 8
 MAX_CHATS_IN_MEMORY = 512
+# Options that make Ollama reload a model when they differ from the loaded runner.
+LOAD_OPTIONS = ("num_ctx", "num_batch", "num_gpu", "num_thread", "use_mmap", "use_mlock", "main_gpu", "numa")
 
 _NOISE = re.compile(
     r"<think>.*?</think>|<details\b[^>]*type=\"(?:reasoning|tool_calls|code_interpreter)\"[^>]*>.*?</details>",
@@ -168,7 +170,7 @@ class Filter:
         )
         summary_model: str = Field(
             "",
-            description="Model id for summaries. Empty = Open WebUI's task model, else the chat model.",
+            description="Model that writes summaries. Empty = the chat's own model (already loaded, no model swap). 'task' = Open WebUI's task model. Or any model id.",
         )
         summary_max_tokens: int = Field(1000, description="Size cap of the summary.")
         summary_chunk_tokens: int = Field(
@@ -176,7 +178,7 @@ class Filter:
         )
         summary_num_ctx: int = Field(
             16384,
-            description="num_ctx sent with summary calls to Ollama models. 0 = leave the model's own setting.",
+            description="num_ctx sent with summary calls when the summary model is a different Ollama model than the chat's. 0 = leave that model's own setting.",
         )
         summary_timeout: int = Field(180, description="Seconds allowed per summary call.")
         bytes_per_token: float = Field(
@@ -189,6 +191,14 @@ class Filter:
         show_status: bool = Field(True, description="Show a status line when a trim happens.")
         persist_state: bool = Field(
             True, description="Save cut points and summaries to disk so they survive restarts."
+        )
+        max_reread_seconds: int = Field(
+            0,
+            description="Cap the budget by time instead of size: never keep more history than the backend can re-read in this many seconds after a cache miss (model reload, chat switch, trim). 0 = off. Needs read_tokens_per_second.",
+        )
+        read_tokens_per_second: float = Field(
+            0,
+            description="Prompt processing speed of your setup in tokens per second, as measured by a benchmark. Used with max_reread_seconds.",
         )
 
     def __init__(self):
@@ -211,11 +221,14 @@ class Filter:
     def _budget(self, body: dict, model: Optional[dict]) -> int:
         v = self.valves
         if v.token_budget > 0:
-            return v.token_budget
-        n = _find_num_ctx(body, model)
-        if n:
-            return max(1024, int(n * v.context_safety) - v.reserve_output_tokens)
-        return v.fallback_token_budget
+            budget = v.token_budget
+        else:
+            n = _find_num_ctx(body, model)
+            budget = max(1024, int(n * v.context_safety) - v.reserve_output_tokens) if n else v.fallback_token_budget
+        if v.max_reread_seconds > 0 and v.read_tokens_per_second > 0:
+            # A context that fits in memory can still be too big to wait for.
+            budget = min(budget, max(1024, int(v.max_reread_seconds * v.read_tokens_per_second)))
+        return budget
 
     # -------------------------------------------------------------------- state
 
@@ -260,18 +273,22 @@ class Filter:
     # ------------------------------------------------------------ summarization
 
     def _summary_model(self, request: Any, chat_model: str) -> str:
+        wanted = self.valves.summary_model.strip()
+        if not wanted:
+            # The chat model is already loaded and is about to re-read the trimmed
+            # history anyway, so it is the cheapest model to ask, and usually the best.
+            return chat_model
         try:
             models = request.app.state.MODELS
-            cfg = request.app.state.config
-            is_ollama = (models.get(chat_model) or {}).get("owned_by") == "ollama"
-            wanted = self.valves.summary_model or (
-                cfg.TASK_MODEL if is_ollama else cfg.TASK_MODEL_EXTERNAL
-            )
+            if wanted.lower() == "task":
+                cfg = request.app.state.config
+                is_ollama = (models.get(chat_model) or {}).get("owned_by") == "ollama"
+                wanted = cfg.TASK_MODEL if is_ollama else cfg.TASK_MODEL_EXTERNAL
             if wanted and wanted in models:
                 return wanted
         except Exception as e:
-            log.debug("context_trim: could not look up the task model: %s", e)
-        return self.valves.summary_model or chat_model
+            log.debug("context_trim: could not look up the summary model: %s", e)
+        return chat_model
 
     def _chunks(self, msgs: list) -> list:
         """Render dropped messages as transcript chunks sized for the summary model."""
@@ -298,7 +315,9 @@ class Filter:
             per_msg = max(per_msg * MAX_SUMMARY_CHUNKS // len(chunks), 200)
         return chunks[-MAX_SUMMARY_CHUNKS:]
 
-    async def _complete(self, request: Any, user: Any, model: str, messages: list) -> str:
+    async def _complete(
+        self, request: Any, user: Any, model: str, messages: list, chat_model: str = "", chat_options: Optional[dict] = None
+    ) -> str:
         from open_webui.utils.chat import generate_chat_completion
 
         form: dict = {
@@ -312,8 +331,17 @@ class Filter:
             is_ollama = (request.app.state.MODELS.get(model) or {}).get("owned_by") == "ollama"
         except Exception:
             is_ollama = False
-        if is_ollama and self.valves.summary_num_ctx > 0:
-            form["options"] = {"num_ctx": self.valves.summary_num_ctx}
+        options: dict = {}
+        if model == chat_model:
+            # Same model as the chat: reuse the chat's own load settings, because any
+            # difference makes Ollama reload the model, which costs far more than the summary.
+            options = {k: v for k, v in (chat_options or {}).items() if k in LOAD_OPTIONS}
+        elif is_ollama and self.valves.summary_num_ctx > 0:
+            options = {"num_ctx": self.valves.summary_num_ctx}
+        if is_ollama:
+            options["think"] = False  # a summary needs no reasoning phase; this makes it several times faster
+        if options:
+            form["options"] = options
 
         res = await generate_chat_completion(request, form, user=user, bypass_filter=True)
         if hasattr(res, "body"):
@@ -322,7 +350,13 @@ class Filter:
         return _NOISE.sub("", content).strip()
 
     async def _summarize(
-        self, request: Any, user_info: Optional[dict], chat_model: str, previous: str, dropped: list
+        self,
+        request: Any,
+        user_info: Optional[dict],
+        chat_model: str,
+        previous: str,
+        dropped: list,
+        chat_options: Optional[dict] = None,
     ) -> str:
         from open_webui.models.users import Users
 
@@ -348,6 +382,8 @@ class Filter:
                         {"role": "system", "content": SUMMARY_SYSTEM},
                         {"role": "user", "content": prompt},
                     ],
+                    chat_model,
+                    chat_options,
                 ),
                 timeout=v.summary_timeout,
             )
@@ -475,8 +511,9 @@ class Filter:
                             }
                         )
                     try:
+                        options = body.get("options") if isinstance(body.get("options"), dict) else None
                         summary = await self._summarize(
-                            request, user_info, model_id, summary, dropped
+                            request, user_info, model_id, summary, dropped, options
                         )
                     except Exception as e:
                         failed = True

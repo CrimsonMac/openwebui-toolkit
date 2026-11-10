@@ -34,6 +34,23 @@ python scripts/vram_estimate.py --file-gb 21 --layers 64 --embed 5120 --heads 40
 
 Take `--layers` (block_count), `--embed` (embedding_length), `--heads` and `--kv-heads` from `ollama show MODEL --verbose`, and `--file-gb` from `ollama list`. Add `--kv-type q8_0` to see the effect of a quantized cache. The result is an estimate; confirm with `ollama ps`.
 
+## Measure instead of guessing
+
+```
+python scripts/ollama_bench.py MODEL --ctx 32768 131072 --batch 512 2048 --repeat 2
+python scripts/ollama_bench.py MODEL --ctx 131072 --option use_mmap=false
+python scripts/ollama_prewarm.py MODEL --load --keep-alive 2h
+```
+
+`ollama_bench.py` loads the model fresh for each setting and reports load time, prompt processing speed, generation speed and the wait on a follow-up turn. Run it on the Ollama host while nobody is using the server. `ollama_prewarm.py` reads the model files into the file cache and can load the model ahead of the first message.
+
+What such measurements commonly show on a card that cannot hold the whole model:
+
+- `num_batch 2048` instead of 512 roughly doubles prompt processing speed, as long as the context is not so large that the bigger buffers push weights off the GPU.
+- A context far larger than needed costs speed even when it is empty, because its cache takes VRAM away from the weights.
+- When speeds swing wildly between runs, the part of the model on the CPU is being paged in and out of the file cache. `PARAMETER use_mmap false` loads it into memory properly: slower to load, then fast and steady. It needs enough free RAM for everything that is not on the GPU.
+- Re-reading a long conversation takes minutes. Keep the history small enough to re-read in the time you are willing to wait, and avoid anything that changes early messages.
+
 ## Levers, in order of effect
 
 1. **Lower `num_ctx`** to what the task needs.
