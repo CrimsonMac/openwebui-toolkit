@@ -1,0 +1,50 @@
+[
+  {
+    "command": "/tldr",
+    "title": "TL;DR",
+    "name": "TL;DR",
+    "content": "Summarize the text below.\n\nGive one sentence with the main point, then three to five bullets with the specifics (keep numbers, names and dates exactly). Use only what the text says. Answer in the language of the text.\n\n<text>\n{{CLIPBOARD}}\n</text>"
+  },
+  {
+    "command": "/fix",
+    "title": "Fix my writing",
+    "name": "Fix my writing",
+    "content": "Correct the spelling, grammar and punctuation of the text below. Keep my wording, tone and language; change only what is wrong. Reply with the corrected text only, then one line listing the changes if there were more than three.\n\n<text>\n{{CLIPBOARD}}\n</text>"
+  },
+  {
+    "command": "/rewrite",
+    "title": "Rewrite in a given tone",
+    "name": "Rewrite in a given tone",
+    "content": "Rewrite the text below so it is {{tone | select:options=[\"clearer and shorter\",\"more formal\",\"friendlier\",\"more direct\"]:default=\"clearer and shorter\"}}. Keep every fact and the original language. Reply with the rewritten text only.\n\n<text>\n{{CLIPBOARD}}\n</text>"
+  },
+  {
+    "command": "/explain",
+    "title": "Explain this code",
+    "name": "Explain this code",
+    "content": "Explain the code below to a developer who has not seen it.\n\n1. What it does, in two sentences.\n2. A walk through the important parts, in order.\n3. Anything surprising, risky or likely to be a bug.\n\nRefer to names from the code. Do not rewrite it unless I ask.\n\n```\n{{CLIPBOARD}}\n```"
+  },
+  {
+    "command": "/commit",
+    "title": "Commit message from a diff",
+    "name": "Commit message from a diff",
+    "content": "Write a git commit message for the diff below.\n\nSubject line: imperative mood, at most 60 characters, no trailing period. Then a blank line and a short body that says why the change was made and anything a reviewer should know. Describe only what the diff shows. Reply with the message only, in a code block.\n\n```diff\n{{CLIPBOARD}}\n```"
+  },
+  {
+    "command": "/critique",
+    "title": "Find the weak points",
+    "name": "Find the weak points",
+    "content": "Act as a sharp but fair critic of the text or plan below. I want problems, not praise.\n\nList the three to five weakest points, most serious first. For each: what is wrong, why it matters, and a concrete way to fix it. Finish with the single change that would improve it most.\n\n<input>\n{{CLIPBOARD}}\n</input>"
+  },
+  {
+    "command": "/translate",
+    "title": "Translate",
+    "name": "Translate",
+    "content": "Translate the text below into {{language | text:placeholder=\"Target language\":default=\"English\"}}. Keep the meaning, tone and formatting. Keep names, code and quoted terms unchanged. Where a phrase has no direct equivalent, pick the natural one. Reply with the translation only.\n\n<text>\n{{CLIPBOARD}}\n</text>"
+  },
+  {
+    "command": "/steps",
+    "title": "Turn into a step-by-step plan",
+    "name": "Turn into a step-by-step plan",
+    "content": "Turn the goal below into a plan I can follow.\n\nGive numbered steps, each one a single action that starts with a verb. Note for each step what I need before starting it, and how I know it is done. Mark the steps where things most often go wrong. If something essential is missing from my description, ask before planning.\n\nGoal: {{goal | textarea:placeholder=\"What do you want to achieve?\"}}"
+  }
+]
