@@ -42,14 +42,16 @@ EXTRACT_RULES = (
     "Write the memories to save, one per line, in exactly one of these forms:\n"
     "GLOBAL: <fact about the user that matters in any chat>\n"
     "{project_form}"
-    "UPDATE <id>: <corrected text of an existing memory that is now outdated>\n"
+    "UPDATE <id>: <full corrected sentence replacing the existing memory with that id>\n"
     "NONE\n\n"
     "Rules:\n"
     "- Save only lasting things the USER stated or confirmed: who they are, their setup, preferences, "
     "goals, decisions, names, versions, paths, constraints.\n"
-    "- Do not save: questions, small talk, things only the assistant said, temporary states, "
-    "passwords, keys or other secrets.\n"
+    "- Do not save: questions, what the user is asking about or finds confusing right now, small talk, "
+    "things only the assistant said, temporary states, passwords, keys or other secrets.\n"
     "- Do not repeat anything already in <existing_memories>.\n"
+    "- When the user says something has changed, use UPDATE with the id shown before that memory "
+    "(the number after #). Only ids listed in <existing_memories> are valid.\n"
     "- Each line is one full sentence that makes sense alone. At most {max_new} lines.\n"
     "- If nothing qualifies, write only NONE. Most conversations give 0 to 3 memories.\n"
     "Output only the lines, nothing else."
@@ -177,7 +179,9 @@ class Filter:
                     if old is not None:
                         old.update(text=text, updated=now)
                         saved.append(text)
-                    continue
+                        continue
+                    # An id that does not exist: keep the fact as a new memory instead of losing it.
+                    kind = "PROJECT" if project[0] else "GLOBAL"
                 slug, name = project if kind == "PROJECT" else ("", "")
                 twin = next(
                     (
@@ -337,6 +341,7 @@ class Filter:
             options = dict(self._options.get(chat_id) or {})
         if is_ollama:
             options["think"] = False
+            options["temperature"] = 0.2  # picking facts is not a creative task
         if options:
             form["options"] = options
         res = await asyncio.wait_for(generate_chat_completion(request, form, user=user, bypass_filter=True), timeout=self.valves.timeout)

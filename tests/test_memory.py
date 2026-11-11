@@ -104,7 +104,7 @@ def test_idle_pass_saves_and_later_chat_sees_it():
     seen, _ = chat(F, "chat-a", LONG)
     assert "[Memory from earlier chats." not in str(seen["messages"]), "nothing saved yet, so nothing to inject"
     assert len(calls) == 1
-    assert calls[0]["options"] == {"num_ctx": 8192, "think": False}, "same load options as the chat, thinking off"
+    assert calls[0]["options"] == {"num_ctx": 8192, "think": False, "temperature": 0.2}, "same load options as the chat, thinking off"
     assert "atlas" in calls[0]["messages"][1]["content"]
 
     seen, _ = chat(F, "chat-b", "What do you know about my server?")
@@ -161,10 +161,11 @@ def test_remember_command_and_update():
     T = load("tools", "memory").Tools()
     assert "peanuts" in asyncio.run(T.recall("allergic", __user__={"id": "u4"}))
 
-    replies[:] = ["UPDATE 1: The user is allergic to peanuts and shellfish.\nUPDATE 99: nothing\nPROJECT: no project here, so this goes global."]
+    replies[:] = ["UPDATE 1: The user is allergic to peanuts and shellfish.\nUPDATE 99: The user also keeps bees in the garden.\nPROJECT: no project here, so this goes global."]
     chat(F, "chat-s", LONG, user="u4")
     got = asyncio.run(T.recall("", __user__={"id": "u4"}))
     assert "shellfish" in got and "goes global" in got and got.count("allergic") == 1
+    assert "bees" in got, "an update that names a missing id is kept as a new memory"
 
 
 def test_never_in_the_way():
