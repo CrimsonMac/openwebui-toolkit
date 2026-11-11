@@ -34,6 +34,10 @@ To apply it by hand instead, set on the model: temperature `0.2`, presence penal
 When looking at an image, report only what is clearly visible. If a detail is small, hidden or unclear, say it is unclear instead of guessing. Copy text exactly as written. Do not name people, characters or brands unless readable text in the image names them.
 ```
 
+## Which models need it
+
+The problem showed on the Qwen model with chat settings. A 26B Gemma model at temperature 0.6 without a presence penalty was already consistent on the same kind of question (word overlap 0.70 - 0.77 before, 0.54 - 1.0 with the filter, three runs each, so within noise). The filter does no harm there but is not needed.
+
 ## Things to know
 
 - Parameters set under Advanced Params of a model in Open WebUI win over the filter. If temperature or presence penalty is set there, clear it or the filter cannot change it. Values from an Ollama Modelfile are overridden as intended.

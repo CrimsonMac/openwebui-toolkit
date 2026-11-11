@@ -31,13 +31,17 @@ How you work:
 7. Keep answers short. Commands in code blocks. No generic checklists and no lectures.
 ```
 
+## Why the tools matter more than the parameters
+
+A 35B Qwen model with its chat settings, asked twelve short security questions from memory with no tools, got eight right. The four it missed were a hashcat mode number, two CVSS scores from a vector, and a ROT13 decode: exactly the lookups and calculations that `sec_tools` does exactly. Attaching the tool and telling the model to use it (rule 1 of the system prompt) is the biggest single gain.
+
 ## Parameters
 
 Set these under Advanced Params of the model in Open WebUI, or in the Ollama Modelfile:
 
 | Parameter | Value | Why |
 |---|---|---|
-| temperature | 0.6 | The publisher's recommendation for precise work with thinking on, as opposed to 1.0 for general chat. Not measured here |
+| temperature | 0.6 | The publisher's recommendation for precise work with thinking on, as opposed to 1.0 for general chat. A comparison against the chat settings was started but not completed, so this is not a measured gain |
 | top_p | 0.95 | |
 | top_k | 20 | |
 | presence_penalty | 0 | A presence penalty punishes every repeated token. Security output repeats on purpose: paths, flags, hex, table rows |

@@ -149,6 +149,8 @@ How memories reach the model: at the start of a chat the newest memories (up to 
 
 Temporary chats are never read for memories.
 
+The idle pass does not cost the chat its prompt cache: measured on Ollama, a 30,000-token conversation was picked up again instantly after an unrelated short request in between.
+
 ## Context Trim in detail
 
 When a chat grows past the budget, the filter frees room in two steps, least harmful first.
