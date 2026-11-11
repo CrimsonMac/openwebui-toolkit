@@ -273,14 +273,20 @@ def test_calibration_learns_from_usage():
     msgs = convo(5)
     run(f, msgs, "calib")
     raw = f._pending["calib"][1]
-    body = {"chat_id": "calib", "messages": [{"role": "assistant", "content": "x", "usage": {"prompt_tokens": int(raw * 1.5)}}]}
+    body = {"chat_id": "calib", "messages": [{"role": "assistant", "content": "x", "usage": {"prompt_tokens": int(raw * 1.3)}}]}
     asyncio.run(f.outlet(body))
-    assert abs(f._calibration["big"] - 1.5) < 0.01
+    assert abs(f._calibration["big"] - 1.3) < 0.01
     # A wildly off sample (RAG injected after us, say) is ignored.
     run(f, msgs, "calib")
     body["messages"][0]["usage"]["prompt_tokens"] = int(raw * 9)
     asyncio.run(f.outlet(body))
-    assert abs(f._calibration["big"] - 1.5) < 0.01
+    assert abs(f._calibration["big"] - 1.3) < 0.01
+    # Tool specs and skill lists added after the filter are a fixed cost; a sample they
+    # inflate must not make the whole history look twice its size.
+    run(f, msgs, "calib")
+    body["messages"][0]["usage"]["prompt_tokens"] = int(raw * 1.9)
+    asyncio.run(f.outlet(body))
+    assert abs(f._calibration["big"] - 1.3) < 0.01
 
 
 def test_huge_backlog_is_capped():
@@ -288,6 +294,85 @@ def test_huge_backlog_is_capped():
     f = new_filter(token_budget=20000)
     run(f, convo(200), "huge")  # ~400k tokens dropped at once
     assert 0 < len(calls) <= ct.MAX_SUMMARY_CHUNKS
+
+
+def agent_chat(turns, result_size=33000):
+    """A chat where every turn calls a tool that returns about 10k tokens."""
+    msgs = [{"role": "system", "content": "You are helpful."}]
+    for i in range(turns):
+        msgs.append({"role": "user", "content": f"task {i}: look up item {i}"})
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"c{i}", "function": {"name": "fetch_page", "arguments": f'{{"url": "https://example.org/{i}"}}'}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "name": "fetch_page", "content": f"PAGE {i} START " + "x" * result_size + f" PAGE {i} END"})
+        msgs.append({"role": "assistant", "content": f"Item {i} costs {i * 7} credits."})
+    msgs.append({"role": "user", "content": "and now?"})
+    return msgs
+
+
+def test_tool_results_are_shortened_before_any_turn_is_dropped():
+    calls.clear()
+    events = []
+    f = new_filter(token_budget=60000)
+    msgs = agent_chat(8)  # ~80k tokens, nearly all of it tool output
+    out = run(f, msgs, "agent", events=events)
+    assert not calls, "no summary needed: the conversation fits once old tool output is shortened"
+    assert len(out) == len(msgs), "every turn is still there"
+    assert [m["content"] for m in out if m["role"] != "tool"] == [m["content"] for m in msgs if m["role"] != "tool"]
+    tools = [m for m in out if m["role"] == "tool"]
+    assert all("removed to save context" in t["content"] for t in tools[:-3])
+    assert all("removed to save context" not in t["content"] for t in tools[-3:]), "the newest results stay whole"
+    assert tools[0]["content"].startswith("PAGE 0 START") and tools[0]["content"].endswith("PAGE 0 END")
+    assert tools[0]["tool_call_id"] == "c0" and len(tools[0]["content"]) < 1600
+    assert est(f, out) <= 60000 and any("shortened 5 old tool results" in e["data"]["description"] for e in events)
+
+
+def test_shortened_results_stay_identical_on_later_turns():
+    f = new_filter(token_budget=60000)
+    msgs = agent_chat(8)
+    first = run(f, msgs, "agent2")
+    more = msgs + [{"role": "assistant", "content": "Nothing new."}, {"role": "user", "content": "ok thanks"}]
+    second = run(f, more, "agent2")
+    assert second[: len(first)] == first, "an unchanged prefix is what keeps the prompt cache"
+    # Under budget again, so results that were whole stay whole instead of being shortened early.
+    assert sum("removed to save context" in m["content"] for m in second if m["role"] == "tool") == 5
+
+
+def test_tool_loop_inside_one_turn_keeps_earlier_turns():
+    """Open WebUI runs filters again on every tool round, with the growing turn at the end."""
+    calls.clear()
+    f = new_filter(token_budget=60000)
+    msgs = convo(3)[:-1] + [{"role": "user", "content": "research this"}]
+    for i in range(7):
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"r{i}", "function": {"name": "fetch_page", "arguments": "{}"}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"r{i}", "name": "fetch_page", "content": f"RESULT {i} " + "y" * 33000})
+        out = run(f, msgs, "loop")
+        assert est(f, out) <= 60000
+    assert not calls and out[1]["content"].startswith("question 0"), "earlier turns survive a long tool loop"
+    assert all("u" * 3300 in m["content"] for m in out if m["role"] == "user" and m["content"].startswith("question"))
+
+
+def test_summary_records_tool_work_and_scales_with_budget():
+    calls.clear()
+    f = new_filter(token_budget=30000, prune_tool_results=False)
+    run(f, agent_chat(6), "work")
+    prompt = calls[0]["messages"][1]["content"]
+    assert "[called tool fetch_page with" in prompt and "example.org/0" in prompt
+    assert "TOOL RESULT (fetch_page): PAGE 0 START" in prompt and "Item 0 costs 0 credits." in prompt
+    assert "Work done" in prompt and "Current state" in prompt
+    assert f._summary_cap(30000) == 1200 and f._summary_cap(110000) == 2750 and f._summary_cap(400000) == 3000
+    f.valves.summary_max_tokens = 500
+    assert f._summary_cap(110000) == 500
+
+
+def test_warns_once_when_builtin_compaction_is_active():
+    events = []
+    f = new_filter(token_budget=100000)
+    msgs = [{"role": "system", "content": "Be brief.\n\n[CONVERSATION SUMMARY]\nearlier stuff"}, {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}, {"role": "user", "content": "more"}]
+    run(f, msgs, "builtin", events=events)
+    run(f, msgs, "builtin", events=events)
+    assert sum("own context compaction" in e["data"]["description"] for e in events) == 1
+    events.clear()
+    run(f, convo(2), "plain", events=events)
+    assert not events
 
 
 if __name__ == "__main__":

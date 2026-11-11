@@ -151,9 +151,15 @@ Temporary chats are never read for memories.
 
 ## Context Trim in detail
 
-When a chat grows past the budget, the oldest turns are removed and replaced by a summary note in the system prompt.
+When a chat grows past the budget, the filter frees room in two steps, least harmful first.
 
-- **Rolling summary.** Removed turns are summarized by the chat's own model with thinking off (set `summary_model` to `task` or a model id to change that), and each later trim folds the next batch into the same note. If the summary call fails, the turns are dropped and the note says so.
+**Turn off Open WebUI's own compaction when using this filter** (Admin Panel → Settings → Interface → Context Compaction). It runs before any filter, starts at 80,000 tokens by default whatever the model's context size is, and keeps only 40 % of the messages each time. In a chat that uses tools, one turn can add 30,000 tokens, so it fires every turn or two. The filter shows a one-time notice in the chat when it sees that the built-in compaction has already cut the history.
+
+- **Step 1: shorten old tool results.** Fetched pages and command output are most of an agentic chat and the least missed. All but the newest few are cut to their first and last lines, with a note that the tool can be called again. Every message the user and the model wrote stays word for word, and the model still sees which tools it called and roughly what came back. This alone usually gets a chat back under budget.
+- **Step 2: fold the oldest turns into a summary**, only if step 1 was not enough.
+- **Tool loops.** Open WebUI runs filters again on every tool round within one reply. Step 1 keeps a long tool loop under budget without touching earlier turns.
+
+- **Rolling summary.** The note records the goal, the facts, the work done (tools called and what they returned, commands and results, what failed), decisions, the current state and open tasks. Its size grows with the budget, from 1200 up to 3000 tokens. Removed turns are summarized by the chat's own model with thinking off (set `summary_model` to `task` or a model id to change that), and each later trim folds the next batch into the same note. If the summary call fails, the turns are dropped and the note says so.
 - **Stable cut point.** A trim cuts down to 70 % of the budget and then leaves the history alone until the budget is hit again. The prompt prefix stays identical in between, so Ollama can reuse its prompt cache instead of re-reading the whole chat every turn.
 - **Whole turns only.** The kept history always starts on a user message, so tool calls are never separated from their results.
 - **Automatic budget.** Taken from `num_ctx` on the request or the model, × 0.9, minus room for the reply. If no `num_ctx` is found it uses `fallback_token_budget`. Set `token_budget` to pin it by hand.
@@ -164,6 +170,8 @@ When a chat grows past the budget, the oldest turns are removed and replaced by 
 | Valve | Default | Note |
 |---|---|---|
 | `token_budget` | `0` (auto) | Pin this if `num_ctx` is not set where the filter can see it |
+| `prune_tool_results` | on | Step 1. `keep_full_tool_results` (3) and `pruned_tool_chars` (1200) tune it |
+| `summary_max_tokens` | `0` (auto) | 2.5 % of the budget, between 1200 and 3000 |
 | `trim_to_ratio` | `0.7` | Lower trims less often but keeps less verbatim history |
 | `summary_model` | chat model | `task` for Open WebUI's task model, or any model id |
 | `max_reread_seconds` + `read_tokens_per_second` | off | Cap the history by how long a full re-read may take, using your measured prompt speed |
