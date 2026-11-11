@@ -94,6 +94,15 @@ The scripts are plain Python or Bash with no dependencies and work on their own 
 
 `/tldr`, `/fix`, `/rewrite`, `/explain`, `/commit`, `/critique`, `/translate`, `/steps`. Most act on the clipboard, so copy the text first.
 
+## Presets
+
+Model setups to copy: what to attach, a system prompt, parameters, and the reasoning.
+
+| Preset | For |
+|---|---|
+| [security-analyst](presets/security-analyst.md) | Authorized testing, CTFs, vulnerability triage and incident response, using the security tools, skills and knowledge here |
+| [vision](presets/vision.md) | Consistent answers about images, with the measurements behind the settings |
+
 ## Knowledge
 
 Reference sheets written to be retrieved in pieces: every section stands on its own. Each subfolder of [knowledge/](knowledge) becomes one knowledge base.
