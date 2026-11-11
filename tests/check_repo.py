@@ -5,6 +5,7 @@
 - every function and tool has the metadata header and the right class
 - Python files avoid f-string syntax that only works on Python 3.12+ (Open WebUI runs 3.11)
 - prompts.json has the fields the importer needs
+- knowledge files sit in a subfolder, have a title and sections, and a sane size
 """
 
 import ast
@@ -138,13 +139,37 @@ def check_python(folder, classes):
 
 
 def check_scripts():
-    for path in sorted((ROOT / "skills").glob("*/scripts/*.py")):
+    for path in sorted((ROOT / "skills").glob("*/scripts/*.py")) + sorted((ROOT / "scripts").glob("*.py")):
         source = path.read_text(encoding="utf-8")
         try:
             ast.parse(source)
         except SyntaxError as e:
             bad(path, f"syntax error on line {e.lineno}: {e.msg}")
         check_fstrings(path, source)
+
+
+def check_knowledge():
+    """Knowledge files are uploaded as they are, so each must stand alone: a title, real content, a sane size."""
+    count = 0
+    for entry in sorted((ROOT / "knowledge").iterdir()):
+        if not entry.is_dir():
+            bad(entry, "loose file in knowledge/; put it in a subfolder, which becomes the knowledge base")
+            continue
+        for path in sorted(entry.iterdir()):
+            if path.suffix not in (".md", ".txt"):
+                bad(path, "only .md and .txt files belong in knowledge/")
+                continue
+            if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*\.(?:md|txt)", path.name):
+                bad(path, "file name must be lowercase letters, digits and single hyphens")
+            text = path.read_text(encoding="utf-8")
+            if not text.startswith("# "):
+                bad(path, "must start with a '# Title' line")
+            if not 400 <= len(text) <= 60000:
+                bad(path, f"{len(text)} characters; expected 400-60000")
+            if "## " not in text:
+                bad(path, "no '## ' sections; retrieval works on sections")
+            count += 1
+    return count
 
 
 def check_prompts():
@@ -175,7 +200,8 @@ if __name__ == "__main__":
     tools = check_python("tools", ("Tools",))
     check_scripts()
     prompts = check_prompts()
+    knowledge = check_knowledge()
     for line in problems:
         print("FAIL ", line)
-    print(f"{len(skills)} skills, {len(functions)} functions, {len(tools)} tools, {prompts} prompts; {len(problems)} problem(s)")
+    print(f"{len(skills)} skills, {len(functions)} functions, {len(tools)} tools, {prompts} prompts, {knowledge} knowledge files; {len(problems)} problem(s)")
     sys.exit(1 if problems else 0)

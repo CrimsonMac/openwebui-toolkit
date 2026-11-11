@@ -219,6 +219,39 @@ def test_second_opinion():
     assert run(P.pipe(body, __user__={"id": "u"}, __request__=object())).startswith("Second Opinion failed")
 
 
+def test_steady_vision():
+    F = load("steady_vision").Filter()
+    img = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    ollama = {"owned_by": "ollama"}
+
+    text_only = {"messages": [{"role": "user", "content": "hi"}], "options": {"temperature": 1}}
+    assert run(F.inlet({"messages": [{"role": "user", "content": "hi"}], "options": {"temperature": 1}}, __model__=ollama)) == text_only
+
+    body = run(F.inlet({"messages": [{"role": "user", "content": [{"type": "text", "text": "what is this?"}, img]}], "options": {"temperature": 1, "num_ctx": 8192}}, __model__=ollama))
+    assert body["options"] == {"temperature": 0.2, "num_ctx": 8192, "presence_penalty": 0.0}
+    parts = body["messages"][0]["content"]
+    assert parts[1] == img and parts[2]["text"].startswith("[Image rules:")
+    assert run(F.inlet(body, __model__=ollama))["messages"][0]["content"] == parts, "must not stack on repeated calls"
+
+    # A follow-up without an image is still about the image; the old image message keeps its rules.
+    follow = {"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}, {"role": "assistant", "content": "a cat"}, {"role": "user", "content": "what colour?"}]}
+    out = run(F.inlet(follow, __model__=ollama))
+    assert out["options"]["temperature"] == 0.2 and "[Image rules:" in out["messages"][0]["content"] and out["messages"][2]["content"] == "what colour?"
+
+    F.valves.lookback_messages = 2
+    far = {"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}] + [{"role": "user", "content": "x"}] * 4}
+    assert "options" not in run(F.inlet(far, __model__=ollama)), "an image far back no longer matters"
+
+    F = load("steady_vision").Filter()
+    F.valves.seed, F.valves.temperature = 7, -1
+    out = run(F.inlet({"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}]}, __model__=ollama))
+    assert out["options"] == {"presence_penalty": 0.0, "seed": 7}
+    other = run(F.inlet({"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}]}, __model__={"owned_by": "openai"}))
+    assert "options" not in other and "[Image rules:" in other["messages"][0]["content"]
+    task = {"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}]}
+    assert run(F.inlet(dict(task), __metadata__={"task": "title_generation"})) == task
+
+
 if __name__ == "__main__":
     failed = 0
     for name, fn in list(globals().items()):
