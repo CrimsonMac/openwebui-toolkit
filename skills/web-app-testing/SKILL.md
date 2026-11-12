@@ -9,6 +9,8 @@ Understand the application before attacking it. Test one hypothesis at a time an
 
 ## 1. Map
 
+With the Web Inspector tool attached, do the mapping yourself: `site_profile` for the stack and how missing pages are answered, `page_structure` for forms and scripts, `check_paths` for a short list of likely paths, `http_request` to replay a request with changed cookies, headers or body. Never fetch from the code interpreter; it has no network.
+
 - Technology: response headers, cookies names, error pages, `/robots.txt`, `/sitemap.xml`, JS files.
 - Content: `ffuf -u https://T/FUZZ -w wordlist -mc all -fc 404`, virtual hosts with `-H "Host: FUZZ.T"`.
 - Every input: URL parameters, body fields, headers, cookies, file uploads, JSON keys, hidden fields.

@@ -35,7 +35,7 @@ Replace the path with any file from the tables below. Pasting the file's content
 | [cache_watch.py](functions/cache_watch.py) | Filter | Warns when an early change forces the backend to re-read the conversation, says what changed and roughly how long it takes |
 | [auto_memory.py](functions/auto_memory.py) | Filter | Long-term memory that fills itself: reads a chat once it has gone idle and saves lasting facts, saves at once on `/remember ...`, and shows saved memories to the model in later chats. Chats in a folder get that folder's own project memory. Details [below](#memory-in-detail) |
 | [tool_coach.py](functions/tool_coach.py) | Filter | Gets the model to use its tools and skills: short rules in the system prompt, plus a hint on each message naming the tools and skills whose descriptions match it |
-| [steady_vision.py](functions/steady_vision.py) | Filter | Consistent answers about images: lower temperature and no presence penalty while an image is in play, and a rule to report only what is clearly visible |
+| [steady_vision.py](functions/steady_vision.py) | Filter | Consistent answers about images without thinking in circles: while an image is in play, thinking is off, the temperature is low, there is no presence penalty, and a rule says to report only what is clearly visible |
 | [quick_answer.py](functions/quick_answer.py) | Filter (switch) | A switch in the message box that turns off the thinking phase for quick questions |
 | [handoff_brief.py](functions/handoff_brief.py) | Action | Button under a reply that writes a brief of the whole chat to paste into a fresh one |
 | [second_opinion.py](functions/second_opinion.py) | Pipe | A model entry where one model drafts, a second reviews, and the first revises |
@@ -51,6 +51,7 @@ Replace the path with any file from the tables below. Pasting the file's content
 | [chat_history.py](tools/chat_history.py) | Search and read the parts of the current chat that Context Trim shortened or removed, so nothing in a long chat is out of reach |
 | [notes.py](tools/notes.py) | A persistent per-user notebook: save, search, list, read and delete notes across chats |
 | [web_reader.py](tools/web_reader.py) | Fetch a web page as readable text, in parts for long pages, and list its links. Refuses local and private addresses unless allowed |
+| [web_inspector.py](tools/web_inspector.py) | Send any HTTP request with its own method, headers, cookies and body, with cookies kept per chat so a login carries over; profile a site (server, framework, language, TLS certificate, security headers); tell real pages from custom "not found" pages; search page source with a regex; list forms, scripts and comments; read TLS certificates. Runs on the server with full TLS, which the browser code interpreter does not have |
 | [wikipedia.py](tools/wikipedia.py) | Search Wikipedia and read articles or single sections, in any language edition, no API key |
 | [ollama_status.py](tools/ollama_status.py) | See installed and loaded Ollama models, memory use, CPU/GPU split and model parameters. Unloading is off by default |
 
@@ -88,6 +89,7 @@ Skills marked with a script ship a helper the model can run when code execution 
 | [tutor](skills/tutor/SKILL.md) | Teach a topic step by step with checks | |
 | [vulnerability-triage](skills/vulnerability-triage/SKILL.md) | Decide whether a CVE or scanner finding applies and how urgent it is | |
 | [web-app-testing](skills/web-app-testing/SKILL.md) | Test a web app or API: access control, auth, injection, files, SSRF | |
+| [website-analysis](skills/website-analysis/SKILL.md) | Read a site from its responses: stack and language, custom error pages, what a status code proves, and checking each conclusion twice | |
 
 The scripts are plain Python or Bash with no dependencies and work on their own too, for example `python skills/log-triage/scripts/log_summary.py app.log`.
 
@@ -103,6 +105,7 @@ Model setups to copy: what to attach, a system prompt, parameters, and the reaso
 |---|---|
 | [security-analyst](presets/security-analyst.md) | Authorized testing, CTFs, vulnerability triage and incident response, using the security tools, skills and knowledge here |
 | [vision](presets/vision.md) | Consistent answers about images, with the measurements behind the settings |
+| [web-investigator](presets/web-investigator.md) | Inspecting websites with the Web Inspector tool, and what to do about the code interpreter having no network |
 
 ## Knowledge
 

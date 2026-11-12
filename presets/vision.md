@@ -24,11 +24,25 @@ Measured on the same test, word overlap between repeated answers to short questi
 
 With the rule the model also stopped inventing the footwear and answered "unclear" instead. Temperature 0.6 with the rule landed in between.
 
+## Thinking in circles
+
+With the thinking phase on, an image question can go round and round: the model counts or judges a detail, doubts it, looks "once more", and reaches the same point a few paragraphs later. Measured on the 35B Qwen model with one cluttered picture and a question about a count and a small sign, 2500 tokens allowed per answer:
+
+| Setting | Answers given | Six-word sequences in the thinking that repeat |
+|---|---|---|
+| thinking on, temperature 0.2, presence penalty 0 | 0 of 3 (all 2500 tokens spent thinking) | 17 - 43 % |
+| thinking on, temperature 0.6, presence penalty 1.5 | 0 of 3 | 2 - 6 % |
+| thinking off, temperature 0.2, presence penalty 0 | 2 of 2, in 2 and 9 seconds | - |
+
+So the low temperature that makes answers consistent also makes a thinking phase repeat itself word for word, and gentler sampling only makes the circling less literal: the model still did not get to an answer. Switching thinking off for image questions is what works. A picture does not change on a second look, so there is little for a thinking phase to gain.
+
 ## Setup
 
-Install the [Steady Vision](../functions/steady_vision.py) filter and enable it for the vision models, or globally. It applies exactly the third row, only while an image is among the recent messages, and leaves text chats on the model's normal settings. Nothing needs to change in the model itself.
+Install the [Steady Vision](../functions/steady_vision.py) filter and enable it for the vision models, or globally. While an image is among the recent messages it switches thinking off and applies the third row of the first table; text chats stay on the model's normal settings. Nothing needs to change in the model itself.
 
-To apply it by hand instead, set on the model: temperature `0.2`, presence penalty `0`, and add this to the system prompt:
+**Check the model's Advanced Params.** If Think is switched on there (Workspace → Models → the model → Advanced Params), it wins over the filter and thinking stays on. Set it to Default. The filter shows a notice in the chat when it sees this, and then leaves temperature and presence penalty alone so that it at least does not make the circling worse.
+
+To apply it by hand instead, set on the model: Think off, temperature `0.2`, presence penalty `0`, and add this to the system prompt:
 
 ```
 When looking at an image, report only what is clearly visible. If a detail is small, hidden or unclear, say it is unclear instead of guessing. Copy text exactly as written. Do not name people, characters or brands unless readable text in the image names them.
@@ -41,7 +55,8 @@ The problem showed on the Qwen model with chat settings. A 26B Gemma model at te
 ## Things to know
 
 - Parameters set under Advanced Params of a model in Open WebUI win over the filter. If temperature or presence penalty is set there, clear it or the filter cannot change it. Values from an Ollama Modelfile are overridden as intended.
-- Without the presence penalty the model thinks longer before a short answer about an image (about three times as much reasoning text in the test), and in 2 of 96 calls it used up a 3500-token limit while thinking and returned nothing. If answers come back empty or slow, set the filter's `presence_penalty` valve to `0.5`, or use the Quick Answer switch to skip thinking for simple image questions. The value 0.5 was not measured.
-- With thinking off, descriptions were faster but no more consistent.
+- To keep thinking for image questions anyway, set the filter's `thinking` valve to `leave`. The filter then only adds the rules and keeps the chat's own temperature and presence penalty. Expect slow answers and, on pictures with many small details, sometimes none.
+- With thinking off, descriptions were faster but no more consistent; the consistency comes from the sampling settings and the rule.
+- The thinking test used one picture and one question on one model. The Gemma model was not tested for it.
 - For identical answers on a repeat, set the filter's `seed` valve to any number. Regenerate then gives the same answer again.
 - Keep the image large enough to read. Open WebUI's image compression setting (Settings → Interface) shrinks uploads; small text in a screenshot is the first thing lost.

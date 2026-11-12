@@ -228,7 +228,7 @@ def test_steady_vision():
     assert run(F.inlet({"messages": [{"role": "user", "content": "hi"}], "options": {"temperature": 1}}, __model__=ollama)) == text_only
 
     body = run(F.inlet({"messages": [{"role": "user", "content": [{"type": "text", "text": "what is this?"}, img]}], "options": {"temperature": 1, "num_ctx": 8192}}, __model__=ollama))
-    assert body["options"] == {"temperature": 0.2, "num_ctx": 8192, "presence_penalty": 0.0}
+    assert body["options"] == {"temperature": 0.2, "num_ctx": 8192, "presence_penalty": 0.0, "think": False}
     parts = body["messages"][0]["content"]
     assert parts[1] == img and parts[2]["text"].startswith("[Image rules:")
     assert run(F.inlet(body, __model__=ollama))["messages"][0]["content"] == parts, "must not stack on repeated calls"
@@ -243,9 +243,24 @@ def test_steady_vision():
     assert "options" not in run(F.inlet(far, __model__=ollama)), "an image far back no longer matters"
 
     F = load("steady_vision").Filter()
-    F.valves.seed, F.valves.temperature = 7, -1
+    F.valves.seed, F.valves.temperature, F.valves.thinking = 7, -1, "leave"
     out = run(F.inlet({"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}]}, __model__=ollama))
-    assert out["options"] == {"presence_penalty": 0.0, "seed": 7}
+    assert out["options"] == {"seed": 7}, "with thinking left on, the presence penalty is not removed"
+
+    # A Think set in the model's Advanced Params wins over the filter: say so, and do not make the loop worse.
+    F = load("steady_vision").Filter()
+    seen = []
+
+    async def emit(e):
+        seen.append(e["data"]["description"])
+
+    forced = {"owned_by": "ollama", "info": {"params": {"think": True}}}
+    out = run(F.inlet({"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}]}, __model__=forced, __event_emitter__=emit))
+    assert out["options"] == {"think": False} and len(seen) == 1 and "Advanced Params" in seen[0]
+    seen.clear()
+    unset = {"owned_by": "ollama", "info": {"params": {"think": False, "temperature": 1}}}
+    out = run(F.inlet({"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}]}, __model__=unset, __event_emitter__=emit))
+    assert out["options"] == {"temperature": 0.2, "presence_penalty": 0.0, "think": False} and not seen
     other = run(F.inlet({"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}]}, __model__={"owned_by": "openai"}))
     assert "options" not in other and "[Image rules:" in other["messages"][0]["content"]
     task = {"messages": [{"role": "user", "content": "look", "images": ["AAAA"]}]}

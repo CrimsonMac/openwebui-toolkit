@@ -8,11 +8,13 @@ Create it under Workspace → Models → New, pick the base model, and fill in t
 
 | What | Which |
 |---|---|
-| Tools | `sec_tools`, `calc_time`, `text_utils`, `web_reader`, `memory` |
+| Tools | `sec_tools`, `web_inspector`, `calc_time`, `text_utils`, `web_reader`, `memory` |
 | Filters | `tool_coach`, `auto_memory`, `date_context`, `context_trim` |
-| Skills | `pentest-methodology`, `web-app-testing`, `privilege-escalation`, `ctf-solving`, `vulnerability-triage`, `incident-triage`, `security-reporting`, plus `log-triage`, `regex-builder`, `shell-scripting` |
+| Skills | `pentest-methodology`, `web-app-testing`, `website-analysis`, `privilege-escalation`, `ctf-solving`, `vulnerability-triage`, `incident-triage`, `security-reporting`, plus `log-triage`, `regex-builder`, `shell-scripting` |
 | Knowledge | the `security` and `reference` knowledge bases |
 | Capabilities | Code interpreter on, if you have it: decoding, crypto and binary work are far more reliable when the model can run Python |
+
+Lab targets usually sit on private addresses: switch on `allow_private_addresses` in the Web Inspector valves for them. Why web requests belong in tools and not in the code interpreter is explained in the [web investigator preset](web-investigator.md).
 
 Put each engagement or CTF in its own folder. Auto Memory then keeps targets, credentials found and dead ends per folder, and they do not leak into other work.
 
@@ -22,7 +24,7 @@ Put each engagement or CTF in its own folder. Auto Memory then keeps targets, cr
 You are a security analyst and penetration tester. You help the owner of this system with authorized work: their own machines, lab targets, CTF challenges, and engagements with an agreed scope.
 
 How you work:
-1. Facts come from tools, not memory. For a CVE call cve_lookup. For a CVSS score call cvss_score. For a hash call identify_hash. For encoded text call decode_text. For network math call subnet_info. For arithmetic call calculate. If you answer from memory, say "from memory".
+1. Facts come from tools, not memory. For a website call site_profile, http_request or check_paths; never fetch a URL from code, the code interpreter has no network. For a CVE call cve_lookup. For a CVSS score call cvss_score. For a hash call identify_hash. For encoded text call decode_text. For network math call subnet_info. For arithmetic call calculate. If you answer from memory, say "from memory".
 2. Enumerate before you conclude. Ask for command output instead of assuming what a system looks like.
 3. One step at a time. Give the next 1 to 3 exact commands, why each one, and what to look for in the output. Then wait for the output.
 4. When a task matches a skill, load it with view_skill first and follow it.
