@@ -1,7 +1,7 @@
 """
 title: Context Trim
 author: Crimson
-version: 2.2.0
+version: 2.3.0
 required_open_webui_version: 0.5.0
 description: Lets a chat continue past the context limit. Old turns are folded into a rolling summary, the cut point stays put between trims (so the prompt cache survives), old images are dropped, and token estimates calibrate themselves against real usage.
 """
@@ -55,7 +55,10 @@ SUMMARY_INSTRUCTIONS = (
 )
 
 BUILTIN_MARK = "[CONVERSATION SUMMARY]"
-PRUNED = "[... {n} characters of this tool result were removed to save context. Call the tool again if the details are needed ...]"
+PRUNED = (
+    "[... {n} characters of this tool result were removed to save context. "
+    "To see them: read_chat_message(number={k}) if you have the chat history tool, or call the tool again ...]"
+)
 
 
 def _text(content: Any) -> str:
@@ -189,6 +192,18 @@ class Filter:
         pruned_tool_chars: int = Field(
             1200, description="How much of a shortened tool result is kept (its start and its end)."
         )
+        max_tool_result_tokens: int = Field(
+            8000,
+            description="A single tool result larger than this is cut to this size as soon as it appears, so one huge page cannot fill the context. 0 = no limit.",
+        )
+        overhead_tokens: int = Field(
+            6000,
+            description="Room left for what Open WebUI adds after this filter: tool definitions, the skill list, retrieved documents.",
+        )
+        archive: bool = Field(
+            True,
+            description="Keep everything that was shortened or removed on disk, so the Chat History tool can still search and read it.",
+        )
         summary_max_tokens: int = Field(
             0, description="Size cap of the summary. 0 = automatic: 2.5 % of the budget, between 1200 and 3000 tokens."
         )
@@ -248,7 +263,12 @@ class Filter:
             budget = v.token_budget
         else:
             n = _find_num_ctx(body, model)
-            budget = max(1024, int(n * v.context_safety) - v.reserve_output_tokens) if n else v.fallback_token_budget
+            budget = (
+                # The overhead allowance is capped at 5 % so small contexts keep a usable budget.
+                max(1024, int(n * v.context_safety) - v.reserve_output_tokens - min(max(v.overhead_tokens, 0), n // 20))
+                if n
+                else v.fallback_token_budget
+            )
         if v.max_reread_seconds > 0 and v.read_tokens_per_second > 0:
             # A context that fits in memory can still be too big to wait for.
             budget = min(budget, max(1024, int(v.max_reread_seconds * v.read_tokens_per_second)))
@@ -259,16 +279,66 @@ class Filter:
             return self.valves.summary_max_tokens
         return min(max(int(budget * 0.025), 1200), 3000)
 
-    def _pruned(self, m: dict) -> dict:
+    @staticmethod
+    def _shorten(m: dict, keep: int, number: int) -> dict:
         """Copy of a tool message with the middle of a long result removed. Same input, same output."""
         text = _text(m.get("content"))
-        keep = max(self.valves.pruned_tool_chars, 200)
+        keep = max(keep, 200)
         if len(text) <= keep + 300:
             return m
         head = int(keep * 0.7)
         tail = keep - head
-        short = f"{text[:head]}\n{PRUNED.format(n=len(text) - keep)}\n{text[len(text) - tail:]}"
+        short = f"{text[:head]}\n{PRUNED.format(n=len(text) - keep, k=number)}\n{text[len(text) - tail:]}"
         return {**m, "content": short}
+
+    def _pruned(self, m: dict, number: int) -> dict:
+        return self._shorten(m, self.valves.pruned_tool_chars, number)
+
+    # ------------------------------------------------------------------ archive
+
+    def _archive_path(self, chat_id: str) -> str:
+        name = hashlib.sha1(chat_id.encode("utf-8", "ignore")).hexdigest()
+        return os.path.join(_state_dir(), "archive", f"{name}.json")
+
+    def _archive(self, chat_id: str, conv: list, indexes: Any, reset: bool = False) -> None:
+        """Store the full text of messages that are about to be shortened or removed.
+
+        Keyed by the message's number in the chat (1 = first message), which is what the
+        notes left in the context refer to. Read by the Chat History tool.
+        """
+        if not self.valves.archive or not self.valves.persist_state or chat_id.startswith("anon:"):
+            return
+        path = self._archive_path(chat_id)
+        try:
+            data: dict = {}
+            if not reset:
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        data = json.load(f)
+                except (OSError, ValueError):
+                    data = {}
+            changed = reset
+            for i in indexes:
+                key = str(i + 1)
+                if key in data:
+                    continue
+                m = conv[i]
+                text = _text(m.get("content"))
+                for call in m.get("tool_calls") or []:
+                    fn = (call or {}).get("function") or {}
+                    args = fn.get("arguments")
+                    args = args if isinstance(args, str) else json.dumps(args, default=str)
+                    text = f"{text}\n[called tool {fn.get('name', '?')} with {args}]".strip()
+                if text:
+                    data[key] = {"role": m.get("role"), "name": m.get("name") or "", "text": text}
+                    changed = True
+            if changed:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(path + ".tmp", path)
+        except OSError as e:
+            log.warning("context_trim: could not write the archive: %s", e)
 
     # -------------------------------------------------------------------- state
 
@@ -478,10 +548,14 @@ class Filter:
 
     @staticmethod
     def _note(cut: int, summary: str) -> str:
-        head = f"[Context note: the first {cut} messages of this conversation were removed to fit the context window."
+        head = (
+            f"[Context note: messages 1 to {cut} of this conversation were removed to fit the context window. "
+            "Their full text is still stored: if you need an exact detail from them and have the chat history tool, "
+            "use search_chat_history or read_chat_message instead of guessing."
+        )
         if summary:
             return f"{head} What they contained:]\n{summary}"
-        return f"{head} No summary is available; ask the user if something from them is needed.]"
+        return f"{head} No summary is available.]"
 
     @staticmethod
     def _with_note(system: list, note: str) -> list:
@@ -535,7 +609,9 @@ class Filter:
         st = self._get_state(chat_id)
         cut = int(st.get("cut") or 0)
         if cut and (cut >= len(conv) or _fingerprint(conv, cut) != st.get("fp")):
+            # Edited or branched: message numbers no longer mean the same thing.
             st, cut = {}, 0
+            self._archive(chat_id, conv, [], reset=True)
         summary = st.get("summary") or ""
 
         # Old images out. Copies only, so fingerprints of the originals stay valid.
@@ -544,11 +620,29 @@ class Filter:
             if _image_count(conv[i]):
                 work[i] = _without_images(conv[i])
 
+        # One oversized tool result is cut the moment it shows up, and the same way on every
+        # later turn, so it never costs the prompt cache.
+        cap_chars = int(v.max_tool_result_tokens * v.bytes_per_token) if v.max_tool_result_tokens > 0 else 0
+        if cap_chars:
+            capped = int(st.get("capped") or 0)
+            fresh = []
+            for i in range(cut, len(conv)):
+                if conv[i].get("role") == "tool":
+                    short = self._shorten(conv[i], cap_chars, i + 1)
+                    if short is not conv[i]:
+                        work[i] = short
+                        if i >= capped:
+                            fresh.append(i)
+            if fresh:
+                self._archive(chat_id, conv, fresh)
+                st = {**st, "capped": fresh[-1] + 1}
+                self._put_state(chat_id, st)
+
         # Tool results shortened on an earlier turn stay shortened, in exactly the same way.
         prune = min(max(int(st.get("prune") or 0), cut), len(conv)) if v.prune_tool_results else cut
         for i in range(cut, prune):
-            if work[i].get("role") == "tool":
-                work[i] = self._pruned(work[i])
+            if conv[i].get("role") == "tool":
+                work[i] = self._pruned(conv[i], i + 1)
 
         costs: list = []
         suffix: list = []
@@ -569,24 +663,27 @@ class Filter:
 
         budget = self._budget(body, model)
         before = sys_cost + note_cost(cut, summary) + suffix[cut]
+        over = before > budget
 
-        if before > budget and v.prune_tool_results:
+        if over and v.prune_tool_results:
             # Step 1: tool results are the bulk of an agentic chat and the least missed.
             # Shorten all but the newest few; the conversation itself stays word for word.
             keep = max(v.keep_full_tool_results, 0)
             tools = [i for i in range(cut, len(work)) if work[i].get("role") == "tool"]
             limit = len(work) if not keep else (tools[-keep] if len(tools) > keep else prune)
             if limit > prune:
-                shortened = 0
+                shortened = []
                 for i in tools:
                     if prune <= i < limit:
-                        short = self._pruned(work[i])
-                        if short is not work[i]:
+                        short = self._pruned(conv[i], i + 1)
+                        if short is not conv[i]:
                             work[i] = short
-                            shortened += 1
+                            shortened.append(i)
+                self._archive(chat_id, conv, shortened)
+                shortened = len(shortened)
                 prune = limit
                 measure()
-                st = {"cut": cut, "fp": st.get("fp") or "", "summary": summary, "prune": prune}
+                st = {**st, "cut": cut, "fp": st.get("fp") or "", "summary": summary, "prune": prune}
                 self._put_state(chat_id, st)
                 after = sys_cost + note_cost(cut, summary) + suffix[cut]
                 if shortened and emit and v.show_status:
@@ -601,12 +698,16 @@ class Filter:
                     )
                 before = after
 
-        if before > budget:
+        # Step 2 also runs when step 1 only just got under the budget: a chat that sits at
+        # the limit would be trimmed again on the next turn, and every trim makes the
+        # backend re-read the conversation.
+        ratio = min(max(v.trim_to_ratio, 0.1), 1.0)
+        if over and before > budget * (1 + ratio) / 2:
             # Step 2: cut well below the budget so the next trim is many turns away and
             # the backend can keep reusing its prompt cache in between.
             cap = self._summary_cap(budget)
             reserve = cap if v.summarize else 40
-            room = budget * min(max(v.trim_to_ratio, 0.1), 1.0) - sys_cost - reserve
+            room = budget * ratio - sys_cost - reserve
             users = [i for i, m in enumerate(work) if m.get("role") == "user"]
             last_user = users[-1] if users else len(work) - 1
             new_cut = max(last_user, cut)
@@ -617,6 +718,7 @@ class Filter:
 
             if new_cut > cut:
                 dropped = work[cut:new_cut]
+                self._archive(chat_id, conv, range(cut, new_cut))
                 failed = False
                 if v.summarize and request is not None:
                     if emit and v.show_status:
@@ -639,10 +741,8 @@ class Filter:
                         log.warning("context_trim: summary failed, dropping instead: %s", e)
                 cut = new_cut
                 prune = max(prune, cut)
-                self._put_state(
-                    chat_id,
-                    {"cut": cut, "fp": _fingerprint(conv, cut), "summary": summary, "prune": prune},
-                )
+                st = {**st, "cut": cut, "fp": _fingerprint(conv, cut), "summary": summary, "prune": prune}
+                self._put_state(chat_id, st)
                 if emit and v.show_status:
                     after = sys_cost + note_cost(cut, summary) + suffix[cut]
                     how = "dropped (summary failed)" if failed else (

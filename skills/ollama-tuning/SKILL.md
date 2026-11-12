@@ -51,6 +51,35 @@ What such measurements commonly show on a card that cannot hold the whole model:
 - When speeds swing wildly between runs, the part of the model on the CPU is being paged in and out of the file cache. `PARAMETER use_mmap false` loads it into memory properly: slower to load, then fast and steady. It needs enough free RAM for everything that is not on the GPU.
 - Re-reading a long conversation takes minutes. Keep the history small enough to re-read in the time you are willing to wait, and avoid anything that changes early messages.
 
+## When the whole machine freezes
+
+A model that fits at load time can still eat all RAM later. Three things grow after loading:
+
+1. **Saved prompt states.** The llama.cpp server behind Ollama keeps copies of earlier prompts in RAM so it can switch back to them, up to 8192 MiB by default. A copy of a 100,000-token chat is 1 to 2 GB, and a new one is stored whenever a request starts very differently from the last one: another chat, a title or summary request, or a chat whose beginning was trimmed. The log shows it: `journalctl -u ollama | grep "cache state"`.
+2. **Context checkpoints**, up to 32 per chat at about 60 MB each.
+3. **Swap on zram.** Model weights do not compress, so swapping them into compressed RAM frees nothing and the machine stalls.
+
+Fixes, safest first:
+
+- Run the guard, which unloads the models when available RAM drops below a reserve. No root needed:
+
+  ```
+  python scripts/ollama_ram_guard.py --reserve-mb 2048          # watch in a terminal
+  python scripts/ollama_ram_guard.py --install                   # start at login (systemd user service)
+  ```
+
+- Cap what the server may keep, and stop the kernel from swapping the model. Needs root; run `sudo systemctl edit ollama` and add:
+
+  ```
+  [Service]
+  Environment="LLAMA_ARG_CACHE_RAM=1536"
+  Environment="LLAMA_ARG_CTX_CHECKPOINTS=8"
+  MemoryMax=21G
+  MemorySwapMax=0
+  ```
+
+  then `sudo systemctl restart ollama`. Set `MemoryMax` to total RAM minus what the desktop needs minus the reserve; it must be above the model's own size (`RssShmem` plus `RssAnon` in `/proc/PID/status` of `llama-server` right after loading). With `MemoryMax`, a model that outgrows the limit is stopped instead of freezing the machine. Check afterwards that the log line `cache state` shows the new limit; if it still says 8192, this Ollama version does not pass the variable on.
+
 ## Levers, in order of effect
 
 1. **Lower `num_ctx`** to what the task needs.

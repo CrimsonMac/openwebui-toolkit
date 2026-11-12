@@ -215,15 +215,16 @@ def test_oversized_last_turn_is_squeezed():
 
 def test_budget_auto_detects_num_ctx():
     f = new_filter()
-    assert f._budget({"options": {"num_ctx": 32768}}, None) == int(32768 * 0.9) - 4096
-    assert f._budget({}, {"info": {"params": {"num_ctx": 8192}}}) == int(8192 * 0.9) - 4096
+    assert f._budget({"options": {"num_ctx": 32768}}, None) == int(32768 * 0.9) - 4096 - 32768 // 20
+    assert f._budget({}, {"info": {"params": {"num_ctx": 8192}}}) == int(8192 * 0.9) - 4096 - 8192 // 20
+    assert f._budget({"options": {"num_ctx": 131072}}, None) == int(131072 * 0.9) - 4096 - 6000, "room for tool definitions"
     assert f._budget({}, None) == 200000
 
 
 def test_budget_capped_by_reread_time():
     f = new_filter(max_reread_seconds=120, read_tokens_per_second=400)
     assert f._budget({"options": {"num_ctx": 262144}}, None) == 48000
-    assert f._budget({"options": {"num_ctx": 16384}}, None) == int(16384 * 0.9) - 4096, "the smaller limit wins"
+    assert f._budget({"options": {"num_ctx": 16384}}, None) == int(16384 * 0.9) - 4096 - 16384 // 20, "the smaller limit wins"
     f = new_filter(token_budget=100000, max_reread_seconds=60, read_tokens_per_second=200)
     assert f._budget({}, None) == 12000
     assert new_filter(max_reread_seconds=120)._budget({}, None) == 200000, "needs a speed to apply"
@@ -311,7 +312,7 @@ def agent_chat(turns, result_size=33000):
 def test_tool_results_are_shortened_before_any_turn_is_dropped():
     calls.clear()
     events = []
-    f = new_filter(token_budget=60000)
+    f = new_filter(token_budget=60000, max_tool_result_tokens=0)
     msgs = agent_chat(8)  # ~80k tokens, nearly all of it tool output
     out = run(f, msgs, "agent", events=events)
     assert not calls, "no summary needed: the conversation fits once old tool output is shortened"
@@ -326,7 +327,7 @@ def test_tool_results_are_shortened_before_any_turn_is_dropped():
 
 
 def test_shortened_results_stay_identical_on_later_turns():
-    f = new_filter(token_budget=60000)
+    f = new_filter(token_budget=60000, max_tool_result_tokens=0)
     msgs = agent_chat(8)
     first = run(f, msgs, "agent2")
     more = msgs + [{"role": "assistant", "content": "Nothing new."}, {"role": "user", "content": "ok thanks"}]
@@ -339,7 +340,7 @@ def test_shortened_results_stay_identical_on_later_turns():
 def test_tool_loop_inside_one_turn_keeps_earlier_turns():
     """Open WebUI runs filters again on every tool round, with the growing turn at the end."""
     calls.clear()
-    f = new_filter(token_budget=60000)
+    f = new_filter(token_budget=60000, max_tool_result_tokens=0)
     msgs = convo(3)[:-1] + [{"role": "user", "content": "research this"}]
     for i in range(7):
         msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"r{i}", "function": {"name": "fetch_page", "arguments": "{}"}}]})
@@ -361,6 +362,68 @@ def test_summary_records_tool_work_and_scales_with_budget():
     assert f._summary_cap(30000) == 1200 and f._summary_cap(110000) == 2750 and f._summary_cap(400000) == 3000
     f.valves.summary_max_tokens = 500
     assert f._summary_cap(110000) == 500
+
+
+def load_tool():
+    spec = importlib.util.spec_from_file_location("chat_history", ROOT / "tools" / "chat_history.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.Tools()
+
+
+def test_huge_tool_result_is_cut_on_arrival_and_stays_readable():
+    f = new_filter(token_budget=100000)
+    page = "FIRST LINE " + "z" * 60000 + " the secret code is ZEBRA-4471 " + "z" * 60000 + " LAST LINE"
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "fetch it"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "a", "function": {"name": "fetch_page", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "a", "name": "fetch_page", "content": page},
+    ]
+    out = run(f, msgs, "cap")
+    got = out[-1]["content"]
+    assert len(got) < 8000 * 3.3 + 400 and got.startswith("FIRST LINE") and got.endswith("LAST LINE")
+    assert "read_chat_message(number=3)" in got, "the note says how to get the rest"
+    again = run(f, msgs + [{"role": "assistant", "content": "done"}, {"role": "user", "content": "next"}], "cap")
+    assert again[3]["content"] == got, "cut the same way on every turn"
+
+    T = load_tool()
+    meta = {"chat_id": "cap"}
+    found = asyncio.run(T.search_chat_history("secret code", __metadata__=meta))
+    assert "Message 3, tool result (fetch_page)" in found and "ZEBRA-4471" in found
+    first = asyncio.run(T.read_chat_message(3, __metadata__=meta))
+    assert first.startswith("Message 3") and "FIRST LINE" in first and "part 1 of 21" in first
+    assert "LAST LINE" in asyncio.run(T.read_chat_message(3, part=21, __metadata__=meta))
+    assert "is not stored" in asyncio.run(T.read_chat_message(1, __metadata__=meta))
+
+
+def test_removed_turns_stay_searchable():
+    calls.clear()
+    f = new_filter(token_budget=20000)
+    msgs = convo(30)
+    msgs[1]["content"] = "my router is a Turris Omnia at 10.11.12.1 " + "u" * 3300
+    out = run(f, msgs, "arch")
+    assert "Turris" not in str(out[1:]), "the first turn is gone from the context"
+    assert "messages 1 to" in out[0]["content"] and "search_chat_history" in out[0]["content"]
+    T = load_tool()
+    meta = {"chat_id": "arch"}
+    assert "Message 1, user" in asyncio.run(T.search_chat_history("router Turris", __metadata__=meta))
+    assert "10.11.12.1" in asyncio.run(T.read_chat_message(1, __metadata__=meta))
+    assert "No stored message" in asyncio.run(T.search_chat_history("xylophone", __metadata__=meta))
+    assert "Nothing from this chat" in asyncio.run(T.search_chat_history("router", __metadata__={"chat_id": "other"}))
+    # Editing the history before the cut invalidates message numbers, so the archive starts over.
+    msgs[1]["content"] = "edited"
+    run(f, msgs[:20], "arch")
+    assert "Turris" not in asyncio.run(T.search_chat_history("router Turris", __metadata__=meta))
+
+
+def test_trim_leaves_headroom_instead_of_sitting_at_the_limit():
+    """After a trim the chat must be well under the budget, or the next turn trims again."""
+    calls.clear()
+    f = new_filter(token_budget=60000, max_tool_result_tokens=0, keep_full_tool_results=5)
+    out = run(f, agent_chat(8), "room")  # shortening 3 results leaves ~51k: under budget but too close
+    assert calls, "so older turns are folded away as well"
+    assert est(f, out) <= 60000 * 0.7 + 200
 
 
 def test_warns_once_when_builtin_compaction_is_active():

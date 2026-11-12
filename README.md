@@ -48,6 +48,7 @@ Replace the path with any file from the tables below. Pasting the file's content
 | [text_utils.py](tools/text_utils.py) | Count characters, words and occurrences, word frequency, diff two texts, sort and dedupe lines, run a regex, hash and encode, validate JSON |
 | [memory.py](tools/memory.py) | Long-term memory with one global list and one list per project: remember, recall, forget, list projects. Same store as the Auto Memory filter |
 | [sec_tools.py](tools/sec_tools.py) | Look up a CVE (NVD, EPSS, known-exploited flag), compute a CVSS 3.x score from a vector, identify a hash type with its hashcat mode, peel encodings off a string, decode a JWT, work out a subnet |
+| [chat_history.py](tools/chat_history.py) | Search and read the parts of the current chat that Context Trim shortened or removed, so nothing in a long chat is out of reach |
 | [notes.py](tools/notes.py) | A persistent per-user notebook: save, search, list, read and delete notes across chats |
 | [web_reader.py](tools/web_reader.py) | Fetch a web page as readable text, in parts for long pages, and list its links. Refuses local and private addresses unless allowed |
 | [wikipedia.py](tools/wikipedia.py) | Search Wikipedia and read articles or single sections, in any language edition, no API key |
@@ -71,7 +72,7 @@ Skills marked with a script ship a helper the model can run when code execution 
 | [json-wrangling](skills/json-wrangling/SKILL.md) | Inspect, query, diff and repair JSON | `json_tool.py` |
 | [linux-troubleshooting](skills/linux-troubleshooting/SKILL.md) | Diagnose slowness, full disks, failing services | `sysinfo.sh` |
 | [log-triage](skills/log-triage/SKILL.md) | Find what went wrong in a log | `log_summary.py` |
-| [ollama-tuning](skills/ollama-tuning/SKILL.md) | Context size, memory, speed and Modelfiles | `vram_estimate.py`, `ollama_bench.py`, `ollama_prewarm.py` |
+| [ollama-tuning](skills/ollama-tuning/SKILL.md) | Context size, memory, speed and Modelfiles | `vram_estimate.py`, `ollama_bench.py`, `ollama_prewarm.py`, `ollama_ram_guard.py` |
 | [openwebui-extension-author](skills/openwebui-extension-author/SKILL.md) | Write Open WebUI tools and functions | |
 | [pentest-methodology](skills/pentest-methodology/SKILL.md) | Run an authorized test or lab box phase by phase | |
 | [privilege-escalation](skills/privilege-escalation/SKILL.md) | Get from a low-privileged shell to root or SYSTEM | |
@@ -158,7 +159,9 @@ When a chat grows past the budget, the filter frees room in two steps, least har
 **Turn off Open WebUI's own compaction when using this filter** (Admin Panel → Settings → Interface → Context Compaction). It runs before any filter, starts at 80,000 tokens by default whatever the model's context size is, and keeps only 40 % of the messages each time. In a chat that uses tools, one turn can add 30,000 tokens, so it fires every turn or two. The filter shows a one-time notice in the chat when it sees that the built-in compaction has already cut the history.
 
 - **Step 1: shorten old tool results.** Fetched pages and command output are most of an agentic chat and the least missed. All but the newest few are cut to their first and last lines, with a note that the tool can be called again. Every message the user and the model wrote stays word for word, and the model still sees which tools it called and roughly what came back. This alone usually gets a chat back under budget.
-- **Step 2: fold the oldest turns into a summary**, only if step 1 was not enough.
+- **Step 2: fold the oldest turns into a summary**, if step 1 was not enough or left the chat sitting right at the limit. A trim always ends well below the budget, because every trim makes the backend re-read the conversation and a chat that stays at the limit would be trimmed on every turn.
+- **Nothing is lost.** Everything shortened or removed is kept on disk under `DATA_DIR/context_trim/archive/`. With the [Chat History](tools/chat_history.py) tool attached, the model can search it (`search_chat_history`) and read any earlier message in full by its number (`read_chat_message`); the notes left in the context name the numbers. Attach the tool to every model that uses this filter.
+- **One huge result cannot fill the context.** A single tool result over `max_tool_result_tokens` (8000) is cut to that size the moment it arrives, the same way on every turn, with the rest readable through the tool.
 - **Tool loops.** Open WebUI runs filters again on every tool round within one reply. Step 1 keeps a long tool loop under budget without touching earlier turns.
 
 - **Rolling summary.** The note records the goal, the facts, the work done (tools called and what they returned, commands and results, what failed), decisions, the current state and open tasks. Its size grows with the budget, from 1200 up to 3000 tokens. Removed turns are summarized by the chat's own model with thinking off (set `summary_model` to `task` or a model id to change that), and each later trim folds the next batch into the same note. If the summary call fails, the turns are dropped and the note says so.
@@ -172,6 +175,8 @@ When a chat grows past the budget, the filter frees room in two steps, least har
 | Valve | Default | Note |
 |---|---|---|
 | `token_budget` | `0` (auto) | Pin this if `num_ctx` is not set where the filter can see it |
+| `max_tool_result_tokens` | `8000` | Size limit for one tool result; `0` = none |
+| `overhead_tokens` | `6000` | Room for tool definitions and the skill list, which Open WebUI adds after the filter |
 | `prune_tool_results` | on | Step 1. `keep_full_tool_results` (3) and `pruned_tool_chars` (1200) tune it |
 | `summary_max_tokens` | `0` (auto) | 2.5 % of the budget, between 1200 and 3000 |
 | `trim_to_ratio` | `0.7` | Lower trims less often but keeps less verbatim history |
