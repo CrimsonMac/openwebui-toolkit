@@ -59,26 +59,36 @@ A model that fits at load time can still eat all RAM later. Three things grow af
 2. **Context checkpoints**, up to 32 per chat at about 60 MB each.
 3. **Swap on zram.** Model weights do not compress, so swapping them into compressed RAM frees nothing and the machine stalls.
 
-Fixes, safest first:
+The fix is a wall, not a watchdog: give Ollama a fixed share of RAM that the kernel enforces, and size Ollama's own appetite to stay below it. Then nothing is ever unloaded or killed, and the rest of the RAM always stays with the rest of the PC.
 
-- Run the guard, which unloads the models when available RAM drops below a reserve. No root needed:
+1. Measure what the model holds after loading, and look at the wall:
 
-  ```
-  python scripts/ollama_ram_guard.py --reserve-mb 2048          # watch in a terminal
-  python scripts/ollama_ram_guard.py --install                   # start at login (systemd user service)
-  ```
+   ```
+   python scripts/ollama_ram_wall.py --measure MODEL      # prints "--model-mb N"
+   python scripts/ollama_ram_wall.py --model-mb N         # shows the wall and whether it holds
+   ```
 
-- Cap what the server may keep, and stop the kernel from swapping the model. Needs root; run `sudo systemctl edit ollama` and add:
+2. Get the settings for a wall that leaves a chosen amount to the PC. This prints them and changes nothing:
 
-  ```
-  [Service]
-  Environment="LLAMA_ARG_CACHE_RAM=1536"
-  Environment="LLAMA_ARG_CTX_CHECKPOINTS=8"
-  MemoryMax=21G
-  MemorySwapMax=0
-  ```
+   ```
+   python scripts/ollama_ram_wall.py --plan --keep-free-mb 9000 --model-mb N
+   ```
 
-  then `sudo systemctl restart ollama`. Set `MemoryMax` to total RAM minus what the desktop needs minus the reserve; it must be above the model's own size (`RssShmem` plus `RssAnon` in `/proc/PID/status` of `llama-server` right after loading). With `MemoryMax`, a model that outgrows the limit is stopped instead of freezing the machine. Check afterwards that the log line `cache state` shows the new limit; if it still says 8192, this Ollama version does not pass the variable on.
+3. Apply them (needs root): put the printed block in `/etc/systemd/system/ollama.service.d/zz-memory-wall.conf`, then `sudo systemctl daemon-reload && sudo systemctl restart ollama`. It looks like this:
+
+   ```
+   [Service]
+   MemoryMax=21504M
+   MemorySwapMax=0
+   Environment="LLAMA_ARG_CACHE_RAM=1536"
+   Environment="LLAMA_ARG_CTX_CHECKPOINTS=8"
+   ```
+
+What each line does: `MemoryMax` is the wall. `MemorySwapMax=0` keeps model weights out of swap. The two variables cap the only parts that grow after loading, so the most Ollama can ever ask for is model + prompt cache + checkpoints, and `--plan` keeps that sum below the wall. If the model alone does not fit behind the wall you ask for, `--plan` says so instead of printing settings that would get it killed.
+
+Check afterwards with `python scripts/ollama_ram_wall.py --model-mb N`: it must say "the wall holds", with the wall reached 0 times. Also check that the log line `cache state` shows the new prompt cache limit (`journalctl -u ollama | grep "cache state"`); if it still says 8192, this Ollama version does not pass the variable on.
+
+Do not run a script that unloads the model when memory gets low. It stops answers in the middle, and with the wall in place it is not needed.
 
 ## Levers, in order of effect
 

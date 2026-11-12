@@ -29,7 +29,7 @@ Replace the path with any file from the tables below. Pasting the file's content
 
 | File | Type | What it does |
 |---|---|---|
-| [context_trim.py](functions/context_trim.py) | Filter | Lets a chat continue past the context limit: old turns are folded into a rolling summary, the cut point stays put between trims so the prompt cache survives |
+| [context_trim.py](functions/context_trim.py) | Filter | Keeps long agentic chats inside the context window on every tool round: old tool results are shortened first, then the oldest work is folded into a rolling summary while the current request stays pinned; token counts are corrected from what the backend reports |
 | [date_context.py](functions/date_context.py) | Filter | Tells the model today's date (and optionally the time) without invalidating the prompt cache every turn |
 | [output_cleanup.py](functions/output_cleanup.py) | Filter | Removes leaked chat-template tokens, cuts a reply that got stuck repeating itself, collapses blank lines; leaves code blocks alone |
 | [cache_watch.py](functions/cache_watch.py) | Filter | Warns when an early change forces the backend to re-read the conversation, says what changed and roughly how long it takes |
@@ -72,7 +72,7 @@ Skills marked with a script ship a helper the model can run when code execution 
 | [json-wrangling](skills/json-wrangling/SKILL.md) | Inspect, query, diff and repair JSON | `json_tool.py` |
 | [linux-troubleshooting](skills/linux-troubleshooting/SKILL.md) | Diagnose slowness, full disks, failing services | `sysinfo.sh` |
 | [log-triage](skills/log-triage/SKILL.md) | Find what went wrong in a log | `log_summary.py` |
-| [ollama-tuning](skills/ollama-tuning/SKILL.md) | Context size, memory, speed and Modelfiles | `vram_estimate.py`, `ollama_bench.py`, `ollama_prewarm.py`, `ollama_ram_guard.py` |
+| [ollama-tuning](skills/ollama-tuning/SKILL.md) | Context size, memory, speed and Modelfiles | `vram_estimate.py`, `ollama_bench.py`, `ollama_prewarm.py`, `ollama_ram_wall.py` |
 | [openwebui-extension-author](skills/openwebui-extension-author/SKILL.md) | Write Open WebUI tools and functions | |
 | [pentest-methodology](skills/pentest-methodology/SKILL.md) | Run an authorized test or lab box phase by phase | |
 | [privilege-escalation](skills/privilege-escalation/SKILL.md) | Get from a low-privileged shell to root or SYSTEM | |
@@ -154,35 +154,36 @@ The idle pass does not cost the chat its prompt cache: measured on Ollama, a 30,
 
 ## Context Trim in detail
 
-When a chat grows past the budget, the filter frees room in two steps, least harmful first.
+Built for long agentic chats: many tool calls in one reply, many replies in one chat. When the chat grows past the budget, the filter frees room in two steps, least harmful first.
 
-**Turn off Open WebUI's own compaction when using this filter** (Admin Panel → Settings → Interface → Context Compaction). It runs before any filter, starts at 80,000 tokens by default whatever the model's context size is, and keeps only 40 % of the messages each time. In a chat that uses tools, one turn can add 30,000 tokens, so it fires every turn or two. The filter shows a one-time notice in the chat when it sees that the built-in compaction has already cut the history.
+**Turn off Open WebUI's own compaction when using this filter** (Admin Panel → Settings → Interface → Context Compaction). It runs before any filter, starts at 80,000 tokens by default whatever the model's context size is, and keeps only 40 % of the messages each time. The filter shows a one-time notice in the chat when it sees that the built-in compaction has already cut the history.
 
-- **Step 1: shorten old tool results.** Fetched pages and command output are most of an agentic chat and the least missed. All but the newest few are cut to their first and last lines, with a note that the tool can be called again. Every message the user and the model wrote stays word for word, and the model still sees which tools it called and roughly what came back. This alone usually gets a chat back under budget.
-- **Step 2: fold the oldest turns into a summary**, if step 1 was not enough or left the chat sitting right at the limit. A trim always ends well below the budget, because every trim makes the backend re-read the conversation and a chat that stays at the limit would be trimmed on every turn.
-- **Nothing is lost.** Everything shortened or removed is kept on disk under `DATA_DIR/context_trim/archive/`. With the [Chat History](tools/chat_history.py) tool attached, the model can search it (`search_chat_history`) and read any earlier message in full by its number (`read_chat_message`); the notes left in the context name the numbers. Attach the tool to every model that uses this filter.
-- **One huge result cannot fill the context.** A single tool result over `max_tool_result_tokens` (8000) is cut to that size the moment it arrives, the same way on every turn, with the rest readable through the tool.
-- **Tool loops.** Open WebUI runs filters again on every tool round within one reply. Step 1 keeps a long tool loop under budget without touching earlier turns.
-
-- **Rolling summary.** The note records the goal, the facts, the work done (tools called and what they returned, commands and results, what failed), decisions, the current state and open tasks. Its size grows with the budget, from 1200 up to 3000 tokens. Removed turns are summarized by the chat's own model with thinking off (set `summary_model` to `task` or a model id to change that), and each later trim folds the next batch into the same note. If the summary call fails, the turns are dropped and the note says so.
-- **Stable cut point.** A trim cuts down to 70 % of the budget and then leaves the history alone until the budget is hit again. The prompt prefix stays identical in between, so Ollama can reuse its prompt cache instead of re-reading the whole chat every turn.
-- **Whole turns only.** The kept history always starts on a user message, so tool calls are never separated from their results.
-- **Automatic budget.** Taken from `num_ctx` on the request or the model, × 0.9, minus room for the reply. If no `num_ctx` is found it uses `fallback_token_budget`. Set `token_budget` to pin it by hand.
+- **It watches every tool round.** Open WebUI 0.13 calls a filter's `inlet` only on the first request of a reply; each following tool round goes through a separate `request` hook. The filter implements both, so a reply with 80 tool calls is checked 80 times. Without that, one long reply outgrows the context window, and Ollama then drops the oldest messages without any notice and leaves almost no room for the answer.
+- **Step 1: shorten old tool results.** Fetched pages and command output are most of an agentic chat and the least missed. All but the newest few are cut to their first and last lines, with a note that names the message number to read the rest. Everything the user and the model wrote stays word for word, and the model still sees which tools it called and roughly what came back. Results the model has not answered yet are never touched.
+- **Step 2: fold the oldest messages into a summary**, if step 1 left the chat above 70 % of the budget. The cut may fall inside the current reply: the request the model is working on is then pinned in front of the kept messages, so the model always sees what it was asked. A cut goes down to half the budget, so the next one is far away.
+- **Nothing is lost.** Everything shortened or removed is kept on disk under `DATA_DIR/context_trim/archive/`. With the [Chat History](tools/chat_history.py) tool attached, the model can search it (`search_chat_history`) and read any earlier message in full by its number (`read_chat_message`). Attach the tool to every model that uses this filter.
+- **One huge result cannot fill the context.** A single tool result over `max_tool_result_tokens` (8000) is cut to that size the moment it arrives, with the rest readable through the tool.
+- **Rolling summary.** The note records the goal, the facts, the work done (tools called and what they returned, commands and results), every failed attempt and why, decisions, the current state and the exact next step. It tells the model that finished work is finished. Its size grows with the budget, from 1200 up to 4000 tokens. It is written by the chat's own model with thinking off (set `summary_model` to `task` or a model id to change that), and each later trim folds the next batch into the same note. If the summary call fails, the messages are dropped and the note says so.
+- **The prompt cache survives.** Between two trims the prompt only grows at the end, so Ollama reuses its cache instead of re-reading the chat. The filter recognises its own work: seeing an already trimmed conversation again (which is what a tool round hands it) changes nothing, and the next reply starts with exactly the prompt the last one ended on. In a simulated session of 366 requests at a 131,072 context with 2,000-token tool results, the cache was broken 11 times.
+- **Token counts that match the model.** Bytes per token is not a constant. Measured on a Qwen tokenizer, prose and code take about 4 bytes per token, but JSON, log lines, numbers and hex ids only about 1.5. The filter estimates from what the text is made of (within 0.85 to 1.25 of the real count on 16 kinds of text), then corrects itself from the prompt token count the backend reports after every request, tool rounds included.
+- **Automatic budget.** Context size × 0.9, minus 8192 tokens for the reply. The context size is taken from `num_ctx` on the request or the model; if it is only set in the Ollama Modelfile, the filter asks Ollama (`/api/ps`, then `/api/show`) through Open WebUI's own Ollama connection. If an Ollama model's context size cannot be found at all, a small budget is used and a notice says so. Set `token_budget` to pin it by hand.
 - **Images.** Stripped from all but the last few messages, and the kept ones count toward the budget.
-- **Self-calibration.** The token estimate is corrected per model from the prompt token count the backend reports after each reply.
-- **Edits and restarts.** Editing or branching before the cut point is detected and the summary rebuilt. Cut points and summaries are stored under `DATA_DIR/context_trim/`.
+- **Edits and restarts.** The cut point is remembered by the content of the message it was made at, not by a position, so it holds in the full history and in a trimmed copy alike. If that message is gone (edited or branched history), the filter starts over. State is stored under `DATA_DIR/context_trim/`.
 
 | Valve | Default | Note |
 |---|---|---|
-| `token_budget` | `0` (auto) | Pin this if `num_ctx` is not set where the filter can see it |
+| `token_budget` | `0` (auto) | Pin the budget by hand |
+| `context_safety`, `reserve_output_tokens` | `0.9`, `8192` | How much of the context to fill, and the room left for the reply |
 | `max_tool_result_tokens` | `8000` | Size limit for one tool result; `0` = none |
-| `overhead_tokens` | `6000` | Room for tool definitions and the skill list, which Open WebUI adds after the filter |
-| `prune_tool_results` | on | Step 1. `keep_full_tool_results` (3) and `pruned_tool_chars` (1200) tune it |
-| `summary_max_tokens` | `0` (auto) | 2.5 % of the budget, between 1200 and 3000 |
-| `trim_to_ratio` | `0.7` | Lower trims less often but keeps less verbatim history |
+| `prune_tool_results` | on | Step 1. `keep_full_tool_results` (4) and `pruned_tool_chars` (1200) tune it |
+| `trim_to_ratio` | `0.7` | Step 2 runs when step 1 leaves the chat above this fraction of the budget |
+| `cut_to_ratio` | `0.5` | Step 2 cuts down to this fraction. Lower = fewer trims, less word-for-word history |
 | `summary_model` | chat model | `task` for Open WebUI's task model, or any model id |
-| `max_reread_seconds` + `read_tokens_per_second` | off | Cap the history by how long a full re-read may take, using your measured prompt speed |
-| `summary_num_ctx` | `16384` | Sent with summary calls when a different Ollama model writes them |
+| `summary_max_tokens` | `0` (auto) | 3 % of the budget, between 1200 and 4000 |
+| `ollama_url` | empty | Where to ask for the context size; empty = Open WebUI's Ollama connections |
+| `ollama_fallback_token_budget` | `28000` | Budget for an Ollama model whose context size is unknown |
+| `overhead_tokens` | `6000` | Assumed cost of tool definitions and skills until real counts are seen |
+| `max_reread_seconds` + `read_tokens_per_second` | off | Cap the history by how long a full re-read may take |
 | `keep_images_in_last` | `4` | |
 
 ## Tests

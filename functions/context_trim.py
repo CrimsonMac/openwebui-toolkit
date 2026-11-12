@@ -1,9 +1,9 @@
 """
 title: Context Trim
 author: Crimson
-version: 2.3.0
+version: 3.0.0
 required_open_webui_version: 0.5.0
-description: Lets a chat continue past the context limit. Old turns are folded into a rolling summary, the cut point stays put between trims (so the prompt cache survives), old images are dropped, and token estimates calibrate themselves against real usage.
+description: Keeps long agentic chats inside the context window without losing the thread. Works on every tool round, not only on the first request of a turn. Old tool results are shortened first, then the oldest work is folded into a rolling summary while the current request stays pinned. Everything removed stays readable through the Chat History tool, and token estimates are corrected from the real counts the backend reports.
 """
 
 import asyncio
@@ -14,6 +14,8 @@ import logging
 import os
 import re
 import tempfile
+import time
+import urllib.request
 from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Optional
 
@@ -22,7 +24,7 @@ from pydantic import BaseModel, Field
 log = logging.getLogger("context_trim")
 
 IMAGE_PLACEHOLDER = "[image removed from history]"
-MAX_SUMMARY_CHUNKS = 8
+MAX_SUMMARY_CHUNKS = 6
 MAX_CHATS_IN_MEMORY = 512
 # Options that make Ollama reload a model when they differ from the loaded runner.
 LOAD_OPTIONS = ("num_ctx", "num_batch", "num_gpu", "num_thread", "use_mmap", "use_mlock", "main_gpu", "numa")
@@ -33,10 +35,10 @@ _NOISE = re.compile(
 )
 
 SUMMARY_SYSTEM = (
-    "You maintain the long-term memory of an AI assistant. You are given the "
-    "existing memory note (possibly empty) and the next part of the conversation, "
-    "which is about to be deleted from the assistant's context. Write the updated "
-    "memory note."
+    "You maintain the working memory of an AI assistant that is in the middle of a long task. "
+    "You are given the existing memory note (possibly empty), the request the assistant is "
+    "currently working on, and the next part of the conversation, which is about to be deleted "
+    "from the assistant's context. Write the updated memory note."
 )
 
 SUMMARY_INSTRUCTIONS = (
@@ -46,19 +48,85 @@ SUMMARY_INSTRUCTIONS = (
     "- Be specific. Keep exact names, numbers, dates, versions, file paths, commands, code identifiers, "
     "URLs and error messages. Never write 'various' or 'several' in place of the actual items.\n"
     "- Record the work, not just the topic: which tools were called and what they returned, which commands "
-    "were run and their results, what was tried and failed, what was written or changed.\n"
+    "were run and their results, what was written or changed.\n"
+    "- Record every approach that failed and why, so it is not tried again.\n"
+    "- If a task is still in progress, list the finished steps in order and state the exact next step.\n"
     "- Drop: greetings, filler, superseded drafts, and reasoning that led nowhere.\n"
     "- Use short bullet points under these headings, leaving out empty ones: "
-    "Goal, Facts, Work done, Decisions, Current state, Open tasks.\n"
+    "Goal, Facts, Work done, Failed attempts, Decisions, Current state, Next step.\n"
     "- Write in the language the conversation is held in.\n"
     "- At most {words} words. Output only the note, with no preamble."
 )
 
 BUILTIN_MARK = "[CONVERSATION SUMMARY]"
+
+# The note this filter leaves in the system prompt. The tags let it find and replace its own
+# note when it sees an already trimmed conversation again, which happens on every tool round.
+NOTE_OPEN = "<context_note>"
+NOTE_CLOSE = "</context_note>"
+NOTE_SUMMARY_HEAD = "Summary of the removed messages:"
+_NOTE_RE = re.compile(r"\n\n<context_note>.*?</context_note>", re.DOTALL)
+_NOTE_COUNT_RE = re.compile(r"The first (\d+) messages")
+
 PRUNED = (
-    "[... {n} characters of this tool result were removed to save context. "
-    "To see them: read_chat_message(number={k}) if you have the chat history tool, or call the tool again ...]"
+    "\n[... part of this tool result was removed to save context. Full text: "
+    "read_chat_message(number={k}) if you have the chat history tool, or call the tool again ...]\n"
 )
+_PRUNED_RE = re.compile(r"\n\[\.\.\. part of this tool result was removed to save context\. Full text: read_chat_message\(number=(\d+)\)[^\]]*\]\n")
+
+
+_ALNUM = re.compile(r"[^\W_]+", re.UNICODE)
+_PUNCT = re.compile(r"[^\w\s]|_", re.UNICODE)
+_SPACES = re.compile(r"  +")
+_token_cache: "OrderedDict[tuple, float]" = OrderedDict()
+
+
+def _count_tokens(text: str) -> float:
+    """Estimate the tokens in a text from what it is made of.
+
+    Bytes per token is not a constant: measured on a Qwen tokenizer, prose and code take
+    about 4 bytes per token, but JSON, log lines, numbers and hex ids only about 1.5,
+    because digits and punctuation are one token each. A single ratio therefore counts
+    tool output at half its real size. The weights below were fitted to real token counts
+    of 16 kinds of text and land between 0.85 and 1.25 of the truth on each.
+    """
+    if len(text) < 64:
+        return len(text) / 2.5
+    key = (len(text), hash(text))
+    hit = _token_cache.get(key)
+    if hit is not None:
+        return hit
+    words = letters = wide = odd = digits = 0
+    for run in _ALNUM.findall(text):
+        n = len(run)
+        if n <= 14 and run.isalpha():
+            words += 1
+            letters += n
+            if not run.isascii():
+                wide += sum(1 for c in run if ord(c) > 127)
+        elif run.isdigit():
+            digits += n
+        else:
+            # Ids, hex, base64 and other runs that are not words break into many tokens.
+            d = sum(1 for c in run if c.isdigit())
+            digits += d
+            odd += n - d
+    punct = len(_PUNCT.findall(text))
+    breaks = text.count("\n") + len(_SPACES.findall(text))
+    tokens = 0.4 * words + 0.17 * letters + 0.45 * wide + 0.75 * odd + 1.05 * digits + 0.8 * punct + 1.0 * breaks
+    _token_cache[key] = tokens
+    if len(_token_cache) > 8192:
+        _token_cache.popitem(last=False)
+    return tokens
+
+
+def _chars_per_token(text: str) -> float:
+    """How dense a text is, judged by its first 800 characters so the answer is the same
+    for a tool result and for an already shortened copy of it."""
+    head = text[:800]
+    if len(head) < 64:
+        return 3.0
+    return min(max(len(head) / max(_count_tokens(head), 1.0), 1.2), 5.0)
 
 
 def _text(content: Any) -> str:
@@ -107,15 +175,16 @@ def _middle_cut(text: str, limit: int) -> str:
     return f"{text[:head]}\n[... {dropped} characters omitted ...]\n{text[len(text) - tail:]}"
 
 
-def _fingerprint(msgs: list, upto: int) -> str:
-    """Cheap identity of a message prefix, used to notice edited or branched history."""
-    h = hashlib.blake2b(digest_size=12)
-    for m in msgs[:upto]:
-        t = _text(m.get("content"))
-        h.update(
-            f"{m.get('role')}|{len(t)}|{t[:200]}|{t[-80:]}\x00".encode("utf-8", "ignore")
-        )
-    return h.hexdigest()
+def _key(m: dict) -> str:
+    """Identity of a message that survives everything this filter does to it.
+
+    Built from the role, the tool call ids and the start of the text, so a message is
+    recognised both in the full history and in an already trimmed copy of it.
+    """
+    text = _text(m.get("content")).replace(IMAGE_PLACEHOLDER, "").strip()
+    calls = ",".join(str((c or {}).get("id") or "") for c in m.get("tool_calls") or [] if isinstance(c, dict))
+    raw = f"{m.get('role')}|{m.get('tool_call_id') or ''}|{calls}|{text[:300]}"
+    return hashlib.blake2b(raw.encode("utf-8", "ignore"), digest_size=10).hexdigest()
 
 
 def _find_num_ctx(body: dict, model: Optional[dict]) -> int:
@@ -148,27 +217,76 @@ def _state_dir() -> str:
     return os.path.join(base, "context_trim")
 
 
+def _same_model(a: str, b: str) -> bool:
+    a, b = str(a or ""), str(b or "")
+    if not a or not b:
+        return False
+    return a == b or a.split(":latest")[0] == b.split(":latest")[0]
+
+
+def _ollama_context(urls: list, names: list, timeout: float = 3.0) -> int:
+    """Ask Ollama what context size a model runs with. Blocking; call it in a thread."""
+    for base in urls:
+        base = str(base or "").rstrip("/")
+        if not base:
+            continue
+        try:
+            # A loaded model reports the context it was really started with.
+            with urllib.request.urlopen(f"{base}/api/ps", timeout=timeout) as r:
+                loaded = json.load(r).get("models") or []
+            for entry in loaded:
+                if any(_same_model(entry.get("name"), n) or _same_model(entry.get("model"), n) for n in names):
+                    n = int(entry.get("context_length") or 0)
+                    if n > 0:
+                        return n
+        except Exception as e:
+            log.debug("context_trim: /api/ps failed on %s: %s", base, e)
+        for name in names:
+            try:
+                req = urllib.request.Request(
+                    f"{base}/api/show",
+                    json.dumps({"model": name}).encode("utf-8"),
+                    {"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    shown = json.load(r)
+                found = re.search(r"^\s*num_ctx\s+(\d+)", str(shown.get("parameters") or ""), re.MULTILINE)
+                if found:
+                    return int(found.group(1))
+            except Exception as e:
+                log.debug("context_trim: /api/show failed on %s: %s", base, e)
+    return 0
+
+
 class Filter:
     class Valves(BaseModel):
         priority: int = Field(0, description="Filter order; lower runs first.")
         enabled: bool = Field(True, description="Master switch.")
         token_budget: int = Field(
             0,
-            description="Max prompt tokens. 0 = automatic: num_ctx × context_safety − reserve_output_tokens.",
+            description="Max prompt tokens. 0 = automatic: context size × context_safety − reserve_output_tokens.",
         )
         fallback_token_budget: int = Field(
             200000,
-            description="Budget used when token_budget is 0 and no num_ctx can be found on the request or model.",
+            description="Budget used when token_budget is 0 and no context size is known, for models that are not served by Ollama.",
+        )
+        ollama_fallback_token_budget: int = Field(
+            28000,
+            description="Budget used for an Ollama model whose context size could not be found on the request, the model or by asking Ollama. Kept small on purpose: a prompt larger than the context is cut by Ollama without notice. A warning is shown when this is used.",
         )
         context_safety: float = Field(
-            0.9, description="Fraction of num_ctx to trust, since estimates are rough."
+            0.9, description="Fraction of the context size to fill at most."
         )
         reserve_output_tokens: int = Field(
-            4096, description="Room left for the reply when the budget is automatic."
+            8192, description="Room left for the reply (thinking included) when the budget is automatic."
         )
         trim_to_ratio: float = Field(
             0.7,
-            description="When over budget, trim down to this fraction of it. Lower = fewer trims and longer-lived prompt cache, but less history kept.",
+            description="Shortening old tool results must bring the chat below this fraction of the budget; if it does not, the oldest messages are removed as well.",
+        )
+        cut_to_ratio: float = Field(
+            0.5,
+            description="When messages are removed, remove enough to get down to this fraction of the budget. Lower = fewer trims and longer-lived prompt cache, but less history kept word for word.",
         )
         keep_images_in_last: int = Field(
             4, description="Keep images only in the last N messages."
@@ -176,7 +294,7 @@ class Filter:
         image_tokens: int = Field(1000, description="Estimated cost of one kept image.")
         summarize: bool = Field(
             True,
-            description="Fold dropped messages into a rolling summary instead of just deleting them.",
+            description="Fold removed messages into a rolling summary instead of just deleting them.",
         )
         summary_model: str = Field(
             "",
@@ -184,10 +302,10 @@ class Filter:
         )
         prune_tool_results: bool = Field(
             True,
-            description="When over budget, first shorten old tool results (fetched pages, command output) and keep the conversation itself. Turns are only removed if that is not enough.",
+            description="When over budget, first shorten old tool results (fetched pages, command output) and keep the conversation itself. Messages are only removed if that is not enough.",
         )
         keep_full_tool_results: int = Field(
-            3, description="The newest this-many tool results are never shortened."
+            4, description="The newest this-many tool results are never shortened. Results the model has not answered yet are never shortened either."
         )
         pruned_tool_chars: int = Field(
             1200, description="How much of a shortened tool result is kept (its start and its end)."
@@ -198,29 +316,30 @@ class Filter:
         )
         overhead_tokens: int = Field(
             6000,
-            description="Room left for what Open WebUI adds after this filter: tool definitions, the skill list, retrieved documents.",
+            description="Assumed cost of what Open WebUI adds after this filter (tool definitions, skill list, documents) until real token counts have been seen for the chat.",
         )
         archive: bool = Field(
             True,
             description="Keep everything that was shortened or removed on disk, so the Chat History tool can still search and read it.",
         )
         summary_max_tokens: int = Field(
-            0, description="Size cap of the summary. 0 = automatic: 2.5 % of the budget, between 1200 and 3000 tokens."
+            0, description="Size cap of the summary. 0 = automatic: 3 % of the budget, between 1200 and 4000 tokens."
         )
         summary_chunk_tokens: int = Field(
-            12000, description="How much dropped history is fed to the summary model per call."
+            24000, description="How much removed history is fed to the summary model per call."
         )
         summary_num_ctx: int = Field(
-            16384,
+            32768,
             description="num_ctx sent with summary calls when the summary model is a different Ollama model than the chat's. 0 = leave that model's own setting.",
         )
-        summary_timeout: int = Field(180, description="Seconds allowed per summary call.")
-        bytes_per_token: float = Field(
-            3.3, description="Starting guess for UTF-8 bytes per token."
-        )
+        summary_timeout: int = Field(240, description="Seconds allowed per summary call.")
         auto_calibrate: bool = Field(
             True,
-            description="Correct the token estimate per model from the prompt token counts the backend reports.",
+            description="Correct the token estimate from the prompt token counts the backend reports after every request.",
+        )
+        ollama_url: str = Field(
+            "",
+            description="Where to ask for a model's context size when the request does not carry num_ctx. Empty = Open WebUI's own Ollama connections.",
         )
         show_status: bool = Field(True, description="Show a status line when a trim happens.")
         warn_builtin_compaction: bool = Field(
@@ -243,56 +362,148 @@ class Filter:
         self.valves = self.Valves()
         self._state: "OrderedDict[str, dict]" = OrderedDict()
         self._pending: "OrderedDict[str, tuple]" = OrderedDict()
-        self._calibration: dict = {}
+        self._archives: "OrderedDict[str, dict]" = OrderedDict()
+        self._factor: Optional[dict] = None
+        self._ctx_cache: dict = {}
         self._warned: "OrderedDict[str, bool]" = OrderedDict()
 
     # ---------------------------------------------------------------- estimates
 
     def _raw_tokens(self, m: dict, images: bool = True) -> float:
-        size = len(_text(m.get("content")).encode("utf-8", "ignore"))
-        if m.get("tool_calls"):
-            size += len(json.dumps(m["tool_calls"], default=str))
-        tokens = size / max(self.valves.bytes_per_token, 0.5) + 4
+        """Token estimate before calibration: every field that is sent counts, not only the text."""
+        tokens = _count_tokens(_text(m.get("content"))) + 4
+        extra = {k: v for k, v in m.items() if k not in ("role", "content", "images")}
+        if extra:
+            tokens += _count_tokens(json.dumps(extra, default=str, ensure_ascii=False))
         if images:
             tokens += _image_count(m) * self.valves.image_tokens
         return tokens
 
-    def _budget(self, body: dict, model: Optional[dict]) -> int:
+    def _factors(self) -> dict:
+        if self._factor is None:
+            self._factor = {}
+            if self.valves.persist_state:
+                try:
+                    with open(os.path.join(_state_dir(), "calibration.json"), encoding="utf-8") as f:
+                        data = json.load(f)
+                    self._factor = {str(k): float(x) for k, x in data.items()}
+                except (OSError, ValueError, TypeError, AttributeError):
+                    self._factor = {}
+        return self._factor
+
+    def _k(self, model_id: str) -> float:
+        if not self.valves.auto_calibrate:
+            return 1.0
+        return min(max(self._factors().get(model_id, 1.0), 0.85), 2.5)
+
+    def _overhead(self, st: dict, model_id: str) -> float:
+        """Tokens the backend counts on top of the messages: tool definitions, template, skills."""
+        sample = st.get("sample") if self.valves.auto_calibrate else None
+        if isinstance(sample, dict) and sample.get("model") == model_id:
+            seen = float(sample.get("actual") or 0) - self._k(model_id) * float(sample.get("raw") or 0)
+            return min(max(seen, 0.0), 60000.0)
+        return float(max(self.valves.overhead_tokens, 0))
+
+    def _record_usage(self, chat_id: str, usage: Any) -> None:
+        """Compare the estimate of the request just sent with what the backend counted."""
+        if not self.valves.auto_calibrate or not isinstance(usage, dict):
+            return
+        actual = usage.get("prompt_tokens") or usage.get("prompt_eval_count") or usage.get("input_tokens")
+        try:
+            actual = int(actual or 0)
+        except (TypeError, ValueError):
+            return
+        pending = self._pending.pop(chat_id, None)
+        if not pending or actual <= 0:
+            return
+        model_id, raw, has_images, ctx = pending
+        # A prompt at the context limit was cut by the backend, and image costs are a guess.
+        if has_images or raw < 500 or (ctx and actual >= ctx * 0.97):
+            return
+        if not 0.4 <= actual / raw <= 6.0 and raw > 4000:
+            return
+        st = self._get_state(chat_id)
+        prev = st.get("sample")
+        if isinstance(prev, dict) and prev.get("model") == model_id:
+            d_raw = raw - float(prev.get("raw") or 0)
+            d_actual = actual - float(prev.get("actual") or 0)
+            if abs(d_raw) >= 2000:
+                k = d_actual / d_raw
+                if 0.5 <= k <= 2.5:
+                    factors = self._factors()
+                    old = factors.get(model_id)
+                    factors[model_id] = k if old is None else old * 0.7 + k * 0.3
+                    self._save_factors()
+        st = {**st, "sample": {"model": model_id, "raw": round(raw, 1), "actual": actual}}
+        self._put_state(chat_id, st)
+
+    def _save_factors(self) -> None:
+        if not self.valves.persist_state:
+            return
+        try:
+            os.makedirs(_state_dir(), exist_ok=True)
+            path = os.path.join(_state_dir(), "calibration.json")
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(self._factor or {}, f)
+            os.replace(path + ".tmp", path)
+        except OSError as e:
+            log.warning("context_trim: could not save calibration: %s", e)
+
+    async def _context_size(self, body: dict, model: Optional[dict], request: Any) -> int:
+        """The context size the model really runs with: from the request, the model settings, or Ollama."""
+        n = _find_num_ctx(body, model)
+        if n:
+            return n
+        model_id = str(body.get("model") or "")
+        cached = self._ctx_cache.get(model_id)
+        if cached and time.monotonic() - cached[1] < (600 if cached[0] else 60):
+            return cached[0]
+        names = [model_id]
+        base_id = ((model or {}).get("info") or {}).get("base_model_id")
+        if base_id:
+            names.append(str(base_id))
+        urls = [u.strip() for u in self.valves.ollama_url.split(";") if u.strip()]
+        if not urls:
+            try:
+                urls = list(request.app.state.config.OLLAMA_BASE_URLS or [])
+            except Exception:
+                urls = []
+        n = 0
+        if urls and model_id:
+            try:
+                n = await asyncio.to_thread(_ollama_context, urls, names)
+            except Exception as e:
+                log.debug("context_trim: context size lookup failed: %s", e)
+        self._ctx_cache[model_id] = (n, time.monotonic())
+        return n
+
+    def _budget(self, n: int, ollama: bool = False) -> int:
         v = self.valves
         if v.token_budget > 0:
             budget = v.token_budget
+        elif n:
+            budget = max(1024, int(n * v.context_safety) - min(v.reserve_output_tokens, n // 4))
         else:
-            n = _find_num_ctx(body, model)
-            budget = (
-                # The overhead allowance is capped at 5 % so small contexts keep a usable budget.
-                max(1024, int(n * v.context_safety) - v.reserve_output_tokens - min(max(v.overhead_tokens, 0), n // 20))
-                if n
-                else v.fallback_token_budget
-            )
+            budget = v.ollama_fallback_token_budget if ollama else v.fallback_token_budget
         if v.max_reread_seconds > 0 and v.read_tokens_per_second > 0:
             # A context that fits in memory can still be too big to wait for.
             budget = min(budget, max(1024, int(v.max_reread_seconds * v.read_tokens_per_second)))
         return budget
 
+    @staticmethod
+    def _is_ollama(model_id: str, model: Optional[dict], request: Any) -> bool:
+        model = model or {}
+        if model.get("owned_by") == "ollama" or "ollama" in model:
+            return True
+        try:
+            return (request.app.state.MODELS.get(model_id) or {}).get("owned_by") == "ollama"
+        except Exception:
+            return False
+
     def _summary_cap(self, budget: int) -> int:
         if self.valves.summary_max_tokens > 0:
             return self.valves.summary_max_tokens
-        return min(max(int(budget * 0.025), 1200), 3000)
-
-    @staticmethod
-    def _shorten(m: dict, keep: int, number: int) -> dict:
-        """Copy of a tool message with the middle of a long result removed. Same input, same output."""
-        text = _text(m.get("content"))
-        keep = max(keep, 200)
-        if len(text) <= keep + 300:
-            return m
-        head = int(keep * 0.7)
-        tail = keep - head
-        short = f"{text[:head]}\n{PRUNED.format(n=len(text) - keep, k=number)}\n{text[len(text) - tail:]}"
-        return {**m, "content": short}
-
-    def _pruned(self, m: dict, number: int) -> dict:
-        return self._shorten(m, self.valves.pruned_tool_chars, number)
+        return min(max(int(budget * 0.03), 1200), 4000)
 
     # ------------------------------------------------------------------ archive
 
@@ -300,45 +511,94 @@ class Filter:
         name = hashlib.sha1(chat_id.encode("utf-8", "ignore")).hexdigest()
         return os.path.join(_state_dir(), "archive", f"{name}.json")
 
-    def _archive(self, chat_id: str, conv: list, indexes: Any, reset: bool = False) -> None:
-        """Store the full text of messages that are about to be shortened or removed.
+    def _archive_load(self, chat_id: str) -> dict:
+        """The stored messages of a chat: {"data": number -> entry, "index": hash -> number}."""
+        if chat_id in self._archives:
+            self._archives.move_to_end(chat_id)
+            return self._archives[chat_id]
+        data: dict = {}
+        if self._archive_on(chat_id):
+            try:
+                with open(self._archive_path(chat_id), encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}
+        index = {}
+        for number, entry in data.items():
+            if isinstance(entry, dict) and entry.get("h"):
+                index[entry["h"]] = int(number)
+        arc = {"data": data, "index": index, "dirty": False}
+        self._remember(self._archives, chat_id, arc)
+        return arc
 
-        Keyed by the message's number in the chat (1 = first message), which is what the
-        notes left in the context refer to. Read by the Chat History tool.
+    def _archive_on(self, chat_id: str) -> bool:
+        return bool(self.valves.archive and self.valves.persist_state and not chat_id.startswith("anon:"))
+
+    def _archive_add(self, chat_id: str, m: dict) -> int:
+        """Store the full text of a message and return the number it can be read back with.
+
+        The number belongs to the content, not to a position, so the same message gets the
+        same number whether it is seen in the full history or in a trimmed copy.
         """
-        if not self.valves.archive or not self.valves.persist_state or chat_id.startswith("anon:"):
+        text = _text(m.get("content"))
+        for call in m.get("tool_calls") or []:
+            fn = (call or {}).get("function") or {}
+            args = fn.get("arguments")
+            args = args if isinstance(args, str) else json.dumps(args, default=str)
+            text = f"{text}\n[called tool {fn.get('name', '?')} with {args}]".strip()
+        if not text:
+            return 0
+        arc = self._archive_load(chat_id)
+        h = hashlib.blake2b(
+            f"{m.get('role')}|{m.get('tool_call_id') or ''}|{text}".encode("utf-8", "ignore"), digest_size=12
+        ).hexdigest()
+        if h in arc["index"]:
+            return arc["index"][h]
+        number = max((int(n) for n in arc["data"]), default=0) + 1
+        arc["data"][str(number)] = {"role": m.get("role"), "name": m.get("name") or "", "text": text, "h": h}
+        arc["index"][h] = number
+        arc["dirty"] = True
+        return number
+
+    def _archive_flush(self, chat_id: str) -> None:
+        arc = self._archives.get(chat_id)
+        if not arc or not arc["dirty"]:
+            return
+        arc["dirty"] = False
+        if not self._archive_on(chat_id):
             return
         path = self._archive_path(chat_id)
         try:
-            data: dict = {}
-            if not reset:
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        data = json.load(f)
-                except (OSError, ValueError):
-                    data = {}
-            changed = reset
-            for i in indexes:
-                key = str(i + 1)
-                if key in data:
-                    continue
-                m = conv[i]
-                text = _text(m.get("content"))
-                for call in m.get("tool_calls") or []:
-                    fn = (call or {}).get("function") or {}
-                    args = fn.get("arguments")
-                    args = args if isinstance(args, str) else json.dumps(args, default=str)
-                    text = f"{text}\n[called tool {fn.get('name', '?')} with {args}]".strip()
-                if text:
-                    data[key] = {"role": m.get("role"), "name": m.get("name") or "", "text": text}
-                    changed = True
-            if changed:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path + ".tmp", "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False)
-                os.replace(path + ".tmp", path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(arc["data"], f, ensure_ascii=False)
+            os.replace(path + ".tmp", path)
         except OSError as e:
             log.warning("context_trim: could not write the archive: %s", e)
+
+    def _shorten(self, chat_id: str, m: dict, keep: int) -> dict:
+        """Tool message with the middle of a long result removed.
+
+        Gives the same text whether it starts from the original result or from a copy that
+        was already shortened less, so the prompt stays identical from one request to the next.
+        """
+        text = _text(m.get("content"))
+        keep = max(keep, 200)
+        mark = _PRUNED_RE.search(text)
+        if mark:
+            head, tail, number = text[: mark.start()], text[mark.end():], int(mark.group(1))
+            if len(head) + len(tail) <= keep + 300:
+                return m
+        else:
+            if len(text) <= keep + 300:
+                return m
+            head = tail = text
+            number = self._archive_add(chat_id, m)
+        h = int(keep * 0.7)
+        t = keep - h
+        return {**m, "content": f"{head[:h]}{PRUNED.format(k=number)}{tail[len(tail) - t:]}"}
 
     # -------------------------------------------------------------------- state
 
@@ -357,6 +617,9 @@ class Filter:
                     st = json.load(f)
             except (OSError, ValueError):
                 st = {}
+        if not isinstance(st, dict) or (st.get("cut") and not st.get("anchor")):
+            # Unknown or pre-3.0 state (position based): start over rather than misread it.
+            st = {}
         self._remember(self._state, chat_id, st)
         return st
 
@@ -401,9 +664,9 @@ class Filter:
         return chat_model
 
     def _chunks(self, msgs: list) -> list:
-        """Render dropped messages as transcript chunks sized for the summary model."""
-        chunk_chars = int(self.valves.summary_chunk_tokens * self.valves.bytes_per_token)
-        per_msg = max(chunk_chars // 4, 400)
+        """Render removed messages as transcript chunks sized for the summary model."""
+        chunk_chars = int(self.valves.summary_chunk_tokens * 3)
+        per_msg = max(chunk_chars // 6, 400)
         chunks: list = []
         for _ in range(2):
             chunks, cur, size = [], [], 0
@@ -411,14 +674,14 @@ class Filter:
                 t = _NOISE.sub("", _text(m.get("content"))).strip()
                 role = str(m.get("role", "user")).upper()
                 if m.get("role") == "tool":
-                    # What a tool returned is part of what was done; a short excerpt is enough.
+                    # What a tool returned is part of what was done; an excerpt is enough.
                     role = f"TOOL RESULT ({m.get('name') or 'tool'})"
-                    t = _middle_cut(t, min(per_msg, 1500))
+                    t = _middle_cut(t, min(per_msg, 2000))
                 for call in m.get("tool_calls") or []:
                     fn = (call or {}).get("function") or {}
                     args = fn.get("arguments")
                     args = args if isinstance(args, str) else json.dumps(args, default=str)
-                    t = f"{t}\n[called tool {fn.get('name', '?')} with {_middle_cut(args or '', 300)}]".strip()
+                    t = f"{t}\n[called tool {fn.get('name', '?')} with {_middle_cut(args or '', 400)}]".strip()
                 if not t:
                     continue
                 line = f"{role}: {_middle_cut(t, per_msg)}"
@@ -485,6 +748,7 @@ class Filter:
         dropped: list,
         chat_options: Optional[dict] = None,
         cap: int = 1200,
+        current_request: str = "",
     ) -> str:
         from open_webui.models.users import Users
 
@@ -495,10 +759,12 @@ class Filter:
         v = self.valves
         model = self._summary_model(request, chat_model)
         instructions = SUMMARY_INSTRUCTIONS.format(words=int(cap * 0.6))
+        task = _middle_cut(_NOISE.sub("", current_request).strip(), 3000)
         summary = previous
         for chunk in self._chunks(dropped):
             prompt = (
                 f"<existing_note>\n{summary or '(empty)'}\n</existing_note>\n\n"
+                f"<current_request>\n{task or '(none)'}\n</current_request>\n\n"
                 f"<new_messages>\n{chunk}\n</new_messages>\n\n{instructions}"
             )
             out = await asyncio.wait_for(
@@ -519,21 +785,21 @@ class Filter:
             if not out:
                 raise RuntimeError("summary model returned nothing")
             summary = out
-        return _middle_cut(summary, int(cap * v.bytes_per_token))
+        return _middle_cut(summary, int(cap * 4))
 
     # ----------------------------------------------------------------- trimming
 
-    def _squeeze(self, kept: list, costs: list, excess: float, scale: float) -> None:
-        """Last resort: the newest turn alone is over budget, so cut the middle out of its biggest messages."""
-        bpt = self.valves.bytes_per_token
-        for i in sorted(range(len(kept)), key=lambda k: costs[k], reverse=True):
+    def _squeeze(self, kept: list, costs: list, excess: float, k: float) -> None:
+        """Last resort: what must be kept is still over budget, so cut the middle out of its biggest messages."""
+        for i in sorted(range(len(kept)), key=lambda j: costs[j], reverse=True):
             if excess <= 0:
                 return
             m = kept[i]
             text = _text(m.get("content"))
             if len(text) < 2000:
                 continue
-            remove_chars = min(int(excess / scale * bpt) + 200, len(text) - 1000)
+            bpt = len(text) / max(_count_tokens(text), 1.0)
+            remove_chars = min(int(excess / k * bpt) + 200, len(text) - 1000)
             new_text = _middle_cut(text, len(text) - remove_chars)
             content = m.get("content")
             if isinstance(content, list):
@@ -544,30 +810,104 @@ class Filter:
             else:
                 new_content = new_text
             kept[i] = {**m, "content": new_content}
-            excess -= (len(text) - len(new_text)) / bpt * scale
+            excess -= (len(text) - len(new_text)) / bpt * k
 
     @staticmethod
-    def _note(cut: int, summary: str) -> str:
+    def _note(dropped: int, summary: str) -> str:
         head = (
-            f"[Context note: messages 1 to {cut} of this conversation were removed to fit the context window. "
+            f"{NOTE_OPEN}\nThe first {dropped} messages of this conversation were removed to fit the context window. "
             "Their full text is still stored: if you need an exact detail from them and have the chat history tool, "
-            "use search_chat_history or read_chat_message instead of guessing."
+            "use search_chat_history or read_chat_message instead of guessing or repeating the work. "
+            "Work listed below as done is finished: do not do it again, continue from the current state."
         )
         if summary:
-            return f"{head} What they contained:]\n{summary}"
-        return f"{head} No summary is available.]"
+            return f"{head}\n{NOTE_SUMMARY_HEAD}\n{summary}\n{NOTE_CLOSE}"
+        return f"{head}\nNo summary is available.\n{NOTE_CLOSE}"
+
+    @staticmethod
+    def _take_note(system: list) -> tuple:
+        """Remove this filter's own note from the system messages. Returns (system, note text or '')."""
+        found = ""
+        out = []
+        for m in system:
+            c = m.get("content")
+            if isinstance(c, str) and NOTE_OPEN in c:
+                hit = _NOTE_RE.search(c)
+                if hit:
+                    found = hit.group(0)
+                    c = _NOTE_RE.sub("", c)
+                    if not c:
+                        continue  # a system message that only held the note
+                    m = {**m, "content": c}
+            elif isinstance(c, list):
+                parts = []
+                for p in c:
+                    if isinstance(p, dict) and p.get("type") == "text" and NOTE_OPEN in str(p.get("text")):
+                        hit = _NOTE_RE.search(p["text"])
+                        if hit:
+                            found = hit.group(0)
+                            continue
+                    parts.append(p)
+                if len(parts) != len(c):
+                    m = {**m, "content": parts}
+            out.append(m)
+        return out, found
+
+    @staticmethod
+    def _swap_note(system: list, old: str, new: str) -> list:
+        """Put the current note exactly where the previous one stood."""
+        out = []
+        for m in system:
+            c = m.get("content")
+            if isinstance(c, str) and old in c:
+                c = c.replace(old, new, 1)
+                if not c:
+                    continue
+                m = {**m, "content": c}
+            elif isinstance(c, list):
+                parts = []
+                for p in c:
+                    if isinstance(p, dict) and p.get("type") == "text" and old in str(p.get("text")):
+                        text = p["text"].replace(old, new, 1)
+                        if not text:
+                            continue
+                        p = {**p, "text": text}
+                    parts.append(p)
+                m = {**m, "content": parts}
+            out.append(m)
+        return out
 
     @staticmethod
     def _with_note(system: list, note: str) -> list:
         if not system:
-            return [{"role": "system", "content": note}]
+            return [{"role": "system", "content": f"\n\n{note}"}]
         first = dict(system[0])
         c = first.get("content")
         if isinstance(c, list):
-            first["content"] = c + [{"type": "text", "text": note}]
+            first["content"] = c + [{"type": "text", "text": f"\n\n{note}"}]
         else:
-            first["content"] = f"{_text(c)}\n\n{note}".strip()
+            first["content"] = f"{_text(c)}\n\n{note}"
         return [first] + system[1:]
+
+    @staticmethod
+    def _locate(conv: list, keys: list, key: str, after: str, want: Optional[int]) -> int:
+        """Index of the message with this key, or -1. `after` and `want` settle duplicates."""
+        hits = [i for i, k in enumerate(keys) if k == key and conv[i].get("role") != "tool"]
+        if not hits:
+            return -1
+        if len(hits) > 1 and after:
+            exact = [i for i in hits if i + 1 < len(keys) and keys[i + 1] == after]
+            hits = exact or hits
+        if want is None:
+            return hits[0]
+        return min(hits, key=lambda i: abs(i - want))
+
+    async def _status(self, emit: Any, text: str, done: bool = True) -> None:
+        if emit and self.valves.show_status:
+            try:
+                await emit({"type": "status", "data": {"description": text, "done": done}})
+            except Exception:
+                pass
 
     async def _trim(
         self,
@@ -586,8 +926,8 @@ class Filter:
             return msgs
 
         model_id = str(body.get("model") or "")
-        scale = self._calibration.get(model_id, 1.0) if v.auto_calibrate else 1.0
-        chat_id = str(meta.get("chat_id") or "") or "anon:" + _fingerprint(conv, 1)
+        chat_id = str(meta.get("chat_id") or "") or "anon:" + _key(conv[0])
+        k = self._k(model_id)
 
         # Open WebUI's built-in compaction runs before filters, with its own threshold
         # (80k tokens by default) and keeps 40 % of the messages. Two compactors on one
@@ -595,186 +935,258 @@ class Filter:
         if v.warn_builtin_compaction and emit and chat_id not in self._warned:
             if any(BUILTIN_MARK in _text(m.get("content")) for m in system):
                 self._remember(self._warned, chat_id, True)
-                await emit(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "Open WebUI's own context compaction already cut this chat (Admin Panel → Settings → Interface → Context Compaction). Turn it off to let Context Trim manage the context.",
-                            "done": True,
-                        },
-                    }
+                await self._status(
+                    emit,
+                    "Open WebUI's own context compaction already cut this chat (Admin Panel → Settings → Interface → Context Compaction). Turn it off to let Context Trim manage the context.",
                 )
 
-        # Reuse the previous cut point unless the history before it was edited.
+        # On tool rounds Open WebUI hands back the conversation as this filter left it at
+        # the start of the turn, note included. Take the note out; the current one goes back in below.
+        # It is replaced where it stands: other filters may have added their own text after it,
+        # and moving the note would change the start of the prompt and cost the prompt cache.
+        placed = system
+        system, old_note = self._take_note(system)
         st = self._get_state(chat_id)
-        cut = int(st.get("cut") or 0)
-        if cut and (cut >= len(conv) or _fingerprint(conv, cut) != st.get("fp")):
-            # Edited or branched: message numbers no longer mean the same thing.
-            st, cut = {}, 0
-            self._archive(chat_id, conv, [], reset=True)
-        summary = st.get("summary") or ""
+        keys = [_key(m) for m in conv]
 
-        # Old images out. Copies only, so fingerprints of the originals stay valid.
+        # Where the kept part starts. Found by content, so it works on the full history
+        # and on an already trimmed copy alike.
+        cut = 0
+        if st.get("anchor"):
+            want = None if old_note else int(st.get("dropped") or 0)
+            cut = self._locate(conv, keys, st["anchor"], st.get("anchor_next") or "", want)
+            if cut < 0:
+                cut = 0
+                if not old_note:
+                    # The message the cut was made at is gone: the history was edited or branched.
+                    st = {"sample": st.get("sample")} if st.get("sample") else {}
+                    self._put_state(chat_id, st)
+        elif old_note:
+            # Trimmed earlier but the stored state is gone (restart without persistence):
+            # keep what the note said rather than lose it.
+            body_text = old_note.split(NOTE_SUMMARY_HEAD, 1)
+            count = _NOTE_COUNT_RE.search(old_note)
+            st = {
+                **st,
+                "dropped": int(count.group(1)) if count else 1,
+                "summary": body_text[1].replace(NOTE_CLOSE, "").strip() if len(body_text) > 1 else "",
+            }
+        summary = st.get("summary") or ""
+        dropped_total = int(st.get("dropped") or 0)
+
         work = list(conv)
+
+        # Old images out.
         for i in range(cut, len(conv) - max(v.keep_images_in_last, 0)):
             if _image_count(conv[i]):
                 work[i] = _without_images(conv[i])
 
         # One oversized tool result is cut the moment it shows up, and the same way on every
-        # later turn, so it never costs the prompt cache.
-        cap_chars = int(v.max_tool_result_tokens * v.bytes_per_token) if v.max_tool_result_tokens > 0 else 0
-        if cap_chars:
-            capped = int(st.get("capped") or 0)
-            fresh = []
+        # later request, so it never costs the prompt cache.
+        if v.max_tool_result_tokens > 0:
             for i in range(cut, len(conv)):
                 if conv[i].get("role") == "tool":
-                    short = self._shorten(conv[i], cap_chars, i + 1)
-                    if short is not conv[i]:
-                        work[i] = short
-                        if i >= capped:
-                            fresh.append(i)
-            if fresh:
-                self._archive(chat_id, conv, fresh)
-                st = {**st, "capped": fresh[-1] + 1}
-                self._put_state(chat_id, st)
+                    dense = _chars_per_token(_text(conv[i].get("content")))
+                    work[i] = self._shorten(chat_id, work[i], int(v.max_tool_result_tokens * dense))
 
-        # Tool results shortened on an earlier turn stay shortened, in exactly the same way.
-        prune = min(max(int(st.get("prune") or 0), cut), len(conv)) if v.prune_tool_results else cut
+        # Tool results shortened on an earlier request stay shortened, in exactly the same way.
+        prune = cut
+        if v.prune_tool_results and st.get("prune"):
+            at = self._locate(conv, keys, st["prune"], "", len(conv))
+            prune = max(at, cut)
         for i in range(cut, prune):
             if conv[i].get("role") == "tool":
-                work[i] = self._pruned(conv[i], i + 1)
+                work[i] = self._shorten(chat_id, work[i], v.pruned_tool_chars)
 
-        costs: list = []
+        raws: list = []
         suffix: list = []
 
         def measure() -> None:
-            costs[:] = [self._raw_tokens(m) * scale for m in work]
+            raws[:] = [self._raw_tokens(m) for m in work]
             suffix[:] = [0.0] * (len(work) + 1)
             for i in range(len(work) - 1, -1, -1):
-                suffix[i] = suffix[i + 1] + costs[i]
+                suffix[i] = suffix[i + 1] + raws[i]
+
+        def pin_for(c: int) -> int:
+            """The request that started the work the kept part belongs to, or -1 if it is kept anyway."""
+            if c <= 0 or conv[c].get("role") == "user":
+                return -1
+            for i in range(c - 1, -1, -1):
+                if conv[i].get("role") == "user":
+                    return i
+            return -1
+
+        def note_raw(n: int, s: str) -> float:
+            if not n:
+                return 0.0
+            return _count_tokens(self._note(n, s))
 
         measure()
-        sys_cost = sum(self._raw_tokens(m) for m in system) * scale
+        sys_raw = sum(self._raw_tokens(m) for m in system)
+        overhead = self._overhead(st, model_id)
 
-        def note_cost(c: int, s: str) -> float:
-            if not c:
-                return 0.0
-            return (len(self._note(c, s).encode("utf-8", "ignore")) / v.bytes_per_token) * scale
+        def total(c: int, n: int, s_raw: float) -> float:
+            p = pin_for(c)
+            return overhead + k * (sys_raw + s_raw + (raws[p] if p >= 0 else 0.0) + suffix[c])
 
-        budget = self._budget(body, model)
-        before = sys_cost + note_cost(cut, summary) + suffix[cut]
+        ctx = await self._context_size(body, model, request)
+        ollama = self._is_ollama(model_id, model, request)
+        budget = self._budget(ctx, ollama)
+        if not ctx and ollama and v.token_budget <= 0 and chat_id + "|ctx" not in self._warned:
+            self._remember(self._warned, chat_id + "|ctx", True)
+            await self._status(
+                emit,
+                f"Context Trim could not find the context size of {model_id}; using a small budget of {budget} tokens. Set num_ctx on the model in Open WebUI, or token_budget or ollama_url in this filter's valves.",
+            )
+        before = total(cut, dropped_total, note_raw(dropped_total, summary))
         over = before > budget
 
         if over and v.prune_tool_results:
             # Step 1: tool results are the bulk of an agentic chat and the least missed.
             # Shorten all but the newest few; the conversation itself stays word for word.
-            keep = max(v.keep_full_tool_results, 0)
+            keep = max(v.keep_full_tool_results, 1)
             tools = [i for i in range(cut, len(work)) if work[i].get("role") == "tool"]
-            limit = len(work) if not keep else (tools[-keep] if len(tools) > keep else prune)
-            if limit > prune:
-                shortened = []
-                for i in tools:
-                    if prune <= i < limit:
-                        short = self._pruned(conv[i], i + 1)
-                        if short is not conv[i]:
-                            work[i] = short
-                            shortened.append(i)
-                self._archive(chat_id, conv, shortened)
-                shortened = len(shortened)
-                prune = limit
-                measure()
-                st = {**st, "cut": cut, "fp": st.get("fp") or "", "summary": summary, "prune": prune}
-                self._put_state(chat_id, st)
-                after = sys_cost + note_cost(cut, summary) + suffix[cut]
-                if shortened and emit and v.show_status:
-                    await emit(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Context: shortened {shortened} old tool results, ~{before / 1000:.1f}k → ~{after / 1000:.1f}k tokens",
-                                "done": True,
-                            },
-                        }
-                    )
-                before = after
+            if len(tools) > keep:
+                # Stop at the assistant message that made the calls, so a round of results
+                # is never half shortened and unread results stay whole.
+                limit = tools[-keep]
+                while limit > cut and conv[limit].get("role") == "tool":
+                    limit -= 1
+                if limit > prune:
+                    shortened = 0
+                    for i in tools:
+                        if prune <= i < limit:
+                            short = self._shorten(chat_id, work[i], v.pruned_tool_chars)
+                            if short is not work[i]:
+                                work[i] = short
+                                shortened += 1
+                    prune = limit
+                    st = {**st, "prune": keys[limit]}
+                    self._put_state(chat_id, st)
+                    if shortened:
+                        measure()
+                        after = total(cut, dropped_total, note_raw(dropped_total, summary))
+                        await self._status(
+                            emit,
+                            f"Context: shortened {shortened} old tool results, ~{before / 1000:.1f}k → ~{after / 1000:.1f}k tokens",
+                        )
+                        before = after
 
-        # Step 2 also runs when step 1 only just got under the budget: a chat that sits at
-        # the limit would be trimmed again on the next turn, and every trim makes the
-        # backend re-read the conversation.
+        # Step 2 also runs when step 1 got under the budget but not far: a chat that sits
+        # near the limit would be trimmed again within a few requests, and every trim makes
+        # the backend re-read part of the conversation.
         ratio = min(max(v.trim_to_ratio, 0.1), 1.0)
-        if over and before > budget * (1 + ratio) / 2:
-            # Step 2: cut well below the budget so the next trim is many turns away and
-            # the backend can keep reusing its prompt cache in between.
+        target = budget * min(max(v.cut_to_ratio, 0.1), ratio)
+        if over and before > budget * ratio:
             cap = self._summary_cap(budget)
-            reserve = cap if v.summarize else 40
-            room = budget * ratio - sys_cost - reserve
-            users = [i for i, m in enumerate(work) if m.get("role") == "user"]
-            last_user = users[-1] if users else len(work) - 1
-            new_cut = max(last_user, cut)
-            for i in users:
-                if i > cut and suffix[i] <= room:
-                    new_cut = i
+            reserve = float(cap if v.summarize else 60)
+            # The newest point a cut may be made at: the last request, or the assistant
+            # message whose tool results are the newest thing in the chat.
+            last = len(conv) - 1
+            while last > cut and conv[last].get("role") == "tool":
+                last -= 1
+            new_cut = cut
+            for i in range(cut + 1, last + 1):
+                if conv[i].get("role") == "tool":
+                    continue
+                new_cut = i
+                if total(i, 0, reserve) <= target:
                     break
 
             if new_cut > cut:
-                dropped = work[cut:new_cut]
-                self._archive(chat_id, conv, range(cut, new_cut))
+                gone = work[cut:new_cut]
+                for m in gone:
+                    if not _PRUNED_RE.search(_text(m.get("content"))):
+                        self._archive_add(chat_id, m)
                 failed = False
                 if v.summarize and request is not None:
-                    if emit and v.show_status:
-                        await emit(
-                            {
-                                "type": "status",
-                                "data": {
-                                    "description": f"Condensing {len(dropped)} older messages…",
-                                    "done": False,
-                                },
-                            }
-                        )
+                    await self._status(emit, f"Condensing {len(gone)} older messages…", done=False)
                     try:
                         options = body.get("options") if isinstance(body.get("options"), dict) else None
+                        users = [m for m in conv if m.get("role") == "user"]
                         summary = await self._summarize(
-                            request, user_info, model_id, summary, dropped, options, cap
+                            request,
+                            user_info,
+                            model_id,
+                            summary,
+                            gone,
+                            options,
+                            cap,
+                            _text(users[-1].get("content")) if users else "",
                         )
                     except Exception as e:
                         failed = True
                         log.warning("context_trim: summary failed, dropping instead: %s", e)
+                dropped_total += new_cut - cut
                 cut = new_cut
                 prune = max(prune, cut)
-                st = {**st, "cut": cut, "fp": _fingerprint(conv, cut), "summary": summary, "prune": prune}
+                st = {
+                    **st,
+                    "anchor": keys[cut],
+                    "anchor_next": keys[cut + 1] if cut + 1 < len(keys) else "",
+                    "dropped": dropped_total,
+                    "summary": summary,
+                }
                 self._put_state(chat_id, st)
-                if emit and v.show_status:
-                    after = sys_cost + note_cost(cut, summary) + suffix[cut]
-                    how = "dropped (summary failed)" if failed else (
-                        "summarized" if v.summarize and request is not None else "dropped"
-                    )
-                    await emit(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": f"Context trimmed: {len(dropped)} older messages {how}, ~{before / 1000:.1f}k → ~{after / 1000:.1f}k tokens",
-                                "done": True,
-                            },
-                        }
-                    )
+                after = total(cut, dropped_total, note_raw(dropped_total, summary))
+                how = "dropped (summary failed)" if failed else (
+                    "summarized" if v.summarize and request is not None else "dropped"
+                )
+                await self._status(
+                    emit,
+                    f"Context trimmed: {len(gone)} older messages {how}, ~{before / 1000:.1f}k → ~{after / 1000:.1f}k tokens",
+                )
 
-        kept = work[cut:]
-        kept_costs = costs[cut:]
-        total = sys_cost + note_cost(cut, summary) + suffix[cut]
-        if total > budget:
-            self._squeeze(kept, kept_costs, total - budget, scale)
+        self._archive_flush(chat_id)
 
-        if cut:
-            system = self._with_note(system, self._note(cut, summary))
+        pin = pin_for(cut)
+        if pin >= 0 and _image_count(work[pin]):
+            work[pin] = _without_images(work[pin])
+        kept = ([work[pin]] if pin >= 0 else []) + work[cut:]
+        kept_raws = ([raws[pin]] if pin >= 0 else []) + raws[cut:]
+        final = total(cut, dropped_total, note_raw(dropped_total, summary))
+        if final > budget:
+            self._squeeze(kept, kept_raws, final - budget, k)
+
+        note = self._note(dropped_total, summary) if dropped_total else ""
+        if old_note:
+            system = self._swap_note(placed, old_note, f"\n\n{note}" if note else "")
+        elif note:
+            system = self._with_note(system, note)
         out = system + kept
 
         if v.auto_calibrate:
             raw = sum(self._raw_tokens(m, images=False) for m in out)
             has_images = any(_image_count(m) for m in out)
-            self._remember(self._pending, chat_id, (model_id, raw, has_images))
+            self._remember(self._pending, chat_id, (model_id, raw, has_images, ctx))
         return out
 
     # -------------------------------------------------------------------- hooks
+
+    async def _run(
+        self,
+        body: dict,
+        user: Optional[dict],
+        metadata: Optional[dict],
+        model: Optional[dict],
+        request: Any,
+        emit: Optional[Callable[[dict], Awaitable[None]]],
+    ) -> dict:
+        msgs = body.get("messages") if isinstance(body, dict) else None
+        meta = metadata or (body.get("metadata") if isinstance(body, dict) else None) or {}
+        if (
+            not self.valves.enabled
+            or not isinstance(msgs, list)
+            or len(msgs) < 2
+            or meta.get("task")
+        ):
+            return body
+        try:
+            body["messages"] = await self._trim(body, msgs, meta, user, model, request, emit)
+        except Exception:
+            # A trimming bug must never take the chat down with it.
+            log.exception("context_trim: trimming failed, sending history untouched")
+        return body
 
     async def inlet(
         self,
@@ -785,49 +1197,44 @@ class Filter:
         __request__: Any = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> dict:
-        msgs = body.get("messages")
-        meta = __metadata__ or body.get("metadata") or {}
-        if (
-            not self.valves.enabled
-            or not isinstance(msgs, list)
-            or len(msgs) < 2
-            or meta.get("task")
-        ):
-            return body
+        """First request of a turn."""
+        return await self._run(body, __user__, __metadata__, __model__, __request__, __event_emitter__)
+
+    async def request(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __model__: Optional[dict] = None,
+        __request__: Any = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> dict:
+        """Every request to the model, including each round of a tool loop (Open WebUI 0.13 and later).
+
+        Without this hook nothing watches the context while the model works through tool
+        calls, and one long turn can outgrow the context window.
+        """
+        return await self._run(body, __user__, __metadata__, __model__, __request__, __event_emitter__)
+
+    def stream(self, event: Any, __metadata__: Optional[dict] = None) -> Any:
+        """Pick the real prompt token count out of the response stream."""
         try:
-            body["messages"] = await self._trim(
-                body, msgs, meta, __user__, __model__, __request__, __event_emitter__
-            )
+            usage = event.get("usage") if isinstance(event, dict) else None
+            if usage:
+                self._record_usage(str((__metadata__ or {}).get("chat_id") or ""), usage)
         except Exception:
-            # A trimming bug must never take the chat down with it.
-            log.exception("context_trim: trimming failed, sending history untouched")
-        return body
+            log.debug("context_trim: usage not read from stream", exc_info=True)
+        return event
 
     async def outlet(self, body: dict, __metadata__: Optional[dict] = None) -> dict:
-        """Compare our estimate with the prompt token count the backend reported."""
+        """Fallback for backends that report usage only at the end of the turn."""
         if not self.valves.auto_calibrate:
             return body
         try:
             chat_id = str(body.get("chat_id") or (__metadata__ or {}).get("chat_id") or "")
-            pending = self._pending.pop(chat_id, None)
             last = (body.get("messages") or [{}])[-1]
             usage = last.get("usage") or (last.get("info") or {}).get("usage") or last.get("info") or {}
-            actual = usage.get("prompt_tokens") or usage.get("prompt_eval_count")
-            if pending and actual:
-                model_id, raw, has_images = pending
-                # Small prompts are dominated by fixed overhead, and image costs are a
-                # guess, so neither makes a trustworthy sample.
-                if raw >= 8000 and not has_images:
-                    sample = float(actual) / raw
-                    # Outside this range something else is going on (RAG or tool specs
-                    # added after us, a truncated prompt, cached-token under-reporting).
-                    # Tool specs and skill lists are a fixed cost, not a factor: a wide range
-                    # here would make the whole history look bigger than it is.
-                    if 0.7 <= sample <= 1.4:
-                        old = self._calibration.get(model_id)
-                        self._calibration[model_id] = (
-                            sample if old is None else old * 0.7 + sample * 0.3
-                        )
+            self._record_usage(chat_id, usage)
         except Exception:
             log.debug("context_trim: calibration skipped", exc_info=True)
         return body
